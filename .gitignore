@@ -11,3 +11,4 @@ __pycache__
 mongodb.py
 .clang-format
 logs/
+.*
