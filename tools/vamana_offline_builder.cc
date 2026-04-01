@@ -1,0 +1,994 @@
+/**
+ * Offline Vamana index builder for SHINE.
+ *
+ * Builds a Vamana graph on CPU, computes RaBitQ quantization,
+ * and serializes to SHINE memory node shard format with fixed-size VamanaNode records.
+ *
+ * Steps:
+ *   1. Read dataset from file
+ *   2. Compute medoid (geometric median approximation)
+ *   3. Generate random orthogonal matrix P (Eigen QR)
+ *   4. Build Vamana graph: greedy insert with beam search + RobustPrune
+ *   5. Quantize all vectors using RaBitQ
+ *   6. Serialize to SHINE VamanaNode shard format
+ */
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#include <boost/program_options.hpp>
+#include <Eigen/Dense>
+#include <library/utils.hh>
+
+#include "common/index_path.hh"
+#include "common/types.hh"
+#include "nlohmann/json.hh"
+#include "remote_pointer.hh"
+#include "vamana/vamana_node.hh"
+
+namespace po = boost::program_options;
+
+namespace {
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+struct VamanaBuildConfig {
+  filepath_t data_path{};
+  filepath_t output_prefix{};
+  u32 num_memory_nodes{1};
+  u32 threads{0};
+  u32 R{64};                // max out-degree
+  u32 beam_width{128};      // search beam width
+  f64 alpha{1.2};           // RobustPrune diversity factor
+  u32 rabitq_bits{1};       // bits per dimension
+  i32 seed{1234};
+  size_t max_vectors{std::numeric_limits<u32>::max()};
+  bool ip_distance{false};
+};
+
+// ============================================================================
+// Dataset
+// ============================================================================
+
+struct Dataset {
+  filepath_t source_file{};
+  u32 dim{0};
+  size_t total_vectors{0};
+  vec<element_t> vectors;
+  vec<node_t> ids;
+
+  const float* vector(size_t i) const { return vectors.data() + i * dim; }
+};
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+size_t effective_thread_count(u32 configured_threads) {
+  const size_t detected = std::thread::hardware_concurrency();
+  return configured_threads == 0 ? std::max<size_t>(detected, 1) : configured_threads;
+}
+
+str format_duration(std::chrono::steady_clock::duration duration) {
+  const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+  const auto hours = seconds / 3600;
+  const auto minutes = (seconds % 3600) / 60;
+  const auto secs = seconds % 60;
+  std::ostringstream os;
+  if (hours > 0) os << hours << "h" << minutes << "m" << secs << "s";
+  else if (minutes > 0) os << minutes << "m" << secs << "s";
+  else os << secs << "s";
+  return os.str();
+}
+
+class ProgressReporter {
+public:
+  ProgressReporter(str label, size_t total)
+      : label_(std::move(label)),
+        total_(std::max<size_t>(total, 1)),
+        interactive_(::isatty(fileno(stderr)) != 0),
+        start_(std::chrono::steady_clock::now()),
+        last_render_(start_),
+        thread_([this]() { run(); }) {}
+
+  ~ProgressReporter() { finish(); }
+
+  void increment(size_t value = 1) { current_.fetch_add(value, std::memory_order_relaxed); }
+
+  void finish() {
+    if (!finished_.exchange(true, std::memory_order_relaxed)) {
+      current_.store(total_, std::memory_order_relaxed);
+      if (thread_.joinable()) thread_.join();
+    }
+  }
+
+private:
+  void run() {
+    while (!finished_.load(std::memory_order_relaxed)) {
+      render(false);
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    render(true);
+  }
+
+  void render(bool done) {
+    const size_t current = std::min(current_.load(std::memory_order_relaxed), total_);
+    const double ratio = static_cast<double>(current) / static_cast<double>(total_);
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - start_;
+
+    std::ostringstream os;
+    os << label_ << " ";
+
+    if (interactive_) {
+      constexpr size_t bar_width = 28;
+      const size_t filled = static_cast<size_t>(ratio * static_cast<double>(bar_width));
+      os << "[";
+      for (size_t i = 0; i < bar_width; ++i) os << (i < filled ? '=' : ' ');
+      os << "] " << std::setw(3) << static_cast<int>(ratio * 100.0) << "% ";
+      os << "(" << current << "/" << total_ << ") ";
+      os << "elapsed " << format_duration(elapsed);
+      if (current > 0 && current < total_) {
+        const auto estimated = std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed / ratio);
+        os << " eta " << format_duration(estimated - elapsed);
+      }
+      std::cerr << '\r' << os.str();
+      if (done) std::cerr << '\n';
+      std::cerr.flush();
+      return;
+    }
+
+    const size_t bucket = done ? 20 : static_cast<size_t>(ratio * 20.0);
+    const auto log_interval = std::chrono::seconds(15);
+    if (!done && bucket <= last_bucket_ && (now - last_render_) < log_interval) return;
+    last_bucket_ = std::max(last_bucket_, bucket);
+    last_render_ = now;
+
+    os << static_cast<int>(ratio * 100.0) << "% (" << current << "/" << total_ << ") elapsed "
+       << format_duration(elapsed);
+    if (done) os << " done";
+    std::cerr << os.str() << '\n';
+  }
+
+  const str label_;
+  const size_t total_;
+  const bool interactive_;
+  const std::chrono::steady_clock::time_point start_;
+  std::atomic<size_t> current_{0};
+  std::atomic<bool> finished_{false};
+  size_t last_bucket_{0};
+  std::chrono::steady_clock::time_point last_render_;
+  std::thread thread_;
+};
+
+template <class Function>
+void parallel_for(size_t begin, size_t end, size_t num_threads, Function&& fn) {
+  num_threads = effective_thread_count(num_threads);
+  if (num_threads == 1 || end <= begin + 1) {
+    for (size_t i = begin; i < end; ++i) fn(i, 0);
+    return;
+  }
+  std::atomic<size_t> current{begin};
+  std::exception_ptr last_exception;
+  std::mutex exception_mutex;
+  vec<std::thread> threads;
+  threads.reserve(num_threads);
+  for (size_t tid = 0; tid < num_threads; ++tid) {
+    threads.emplace_back([&, tid]() {
+      for (;;) {
+        const size_t i = current.fetch_add(1);
+        if (i >= end) return;
+        try { fn(i, tid); }
+        catch (...) {
+          std::lock_guard<std::mutex> lock(exception_mutex);
+          if (!last_exception) last_exception = std::current_exception();
+          current.store(end);
+          return;
+        }
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+  if (last_exception) std::rethrow_exception(last_exception);
+}
+
+u32 read_u32(std::ifstream& input) {
+  u32 value{};
+  if (!input.read(reinterpret_cast<char*>(&value), sizeof(value)))
+    lib_failure("failed to read u32 from dataset");
+  return value;
+}
+
+filepath_t resolve_dataset_file(const filepath_t& input_path) {
+  if (std::filesystem::is_regular_file(input_path)) return input_path;
+  if (!std::filesystem::is_directory(input_path)) return input_path;
+  static const vec<str> candidates = {"base.fbin", "base.u8bin", "base.i8bin", "base.bin"};
+  for (const auto& c : candidates) {
+    const filepath_t path = input_path / c;
+    if (std::filesystem::exists(path)) return path;
+  }
+  lib_failure("unable to resolve dataset file under " + input_path.string());
+  return {};
+}
+
+Dataset read_dataset(const VamanaBuildConfig& config) {
+  Dataset dataset;
+  dataset.source_file = resolve_dataset_file(config.data_path);
+
+  std::ifstream input(dataset.source_file, std::ios::binary);
+  lib_assert(input.good(), "dataset file does not exist: " + dataset.source_file.string());
+
+  const str ext = dataset.source_file.extension().string();
+  const bool is_float32 = ext == ".fbin" || ext == ".bin";
+  const bool is_uint8 = ext == ".u8bin";
+  const bool is_int8 = ext == ".i8bin";
+  lib_assert(is_float32 || is_uint8 || is_int8, "unsupported dataset extension: " + ext);
+
+  dataset.total_vectors = read_u32(input);
+  dataset.dim = read_u32(input);
+
+  const size_t num_vectors = std::min(dataset.total_vectors, config.max_vectors);
+  lib_assert(num_vectors > 0, "dataset is empty");
+
+  std::cerr << "reading dataset " << dataset.source_file
+            << " (dim=" << dataset.dim << ", vectors=" << num_vectors
+            << "/" << dataset.total_vectors << ")\n";
+
+  dataset.vectors.resize(num_vectors * dataset.dim);
+  dataset.ids.resize(num_vectors);
+  std::iota(dataset.ids.begin(), dataset.ids.end(), 0);
+
+  if (is_float32) {
+    ProgressReporter progress{"Reading dataset", num_vectors};
+    const size_t rows_per_chunk = std::max<size_t>(1, (8 * 1024 * 1024) / (dataset.dim * sizeof(element_t)));
+    for (size_t row = 0; row < num_vectors; row += rows_per_chunk) {
+      const size_t chunk_rows = std::min(rows_per_chunk, num_vectors - row);
+      const size_t chunk_bytes = chunk_rows * dataset.dim * sizeof(element_t);
+      if (!input.read(reinterpret_cast<char*>(dataset.vectors.data() + row * dataset.dim), chunk_bytes))
+        lib_failure("failed to read float32 dataset payload");
+      progress.increment(chunk_rows);
+    }
+    progress.finish();
+  } else if (is_uint8) {
+    vec<u8> raw(dataset.vectors.size());
+    if (!input.read(reinterpret_cast<char*>(raw.data()), raw.size()))
+      lib_failure("failed to read uint8 dataset payload");
+    ProgressReporter progress{"Converting dataset", num_vectors};
+    parallel_for(0, num_vectors, config.threads, [&](size_t row, size_t) {
+      const size_t base = row * dataset.dim;
+      for (size_t col = 0; col < dataset.dim; ++col)
+        dataset.vectors[base + col] = static_cast<element_t>(raw[base + col]);
+      progress.increment();
+    });
+    progress.finish();
+  } else {
+    vec<i8> raw(dataset.vectors.size());
+    if (!input.read(reinterpret_cast<char*>(raw.data()), raw.size()))
+      lib_failure("failed to read int8 dataset payload");
+    ProgressReporter progress{"Converting dataset", num_vectors};
+    parallel_for(0, num_vectors, config.threads, [&](size_t row, size_t) {
+      const size_t base = row * dataset.dim;
+      for (size_t col = 0; col < dataset.dim; ++col)
+        dataset.vectors[base + col] = static_cast<element_t>(raw[base + col]);
+      progress.increment();
+    });
+    progress.finish();
+  }
+
+  return dataset;
+}
+
+// ============================================================================
+// Distance computation (CPU)
+// ============================================================================
+
+float l2_squared(const float* a, const float* b, u32 dim) {
+  float sum = 0.0f;
+  for (u32 i = 0; i < dim; ++i) {
+    const float d = a[i] - b[i];
+    sum += d * d;
+  }
+  return sum;
+}
+
+float ip_distance(const float* a, const float* b, u32 dim) {
+  float sum = 0.0f;
+  for (u32 i = 0; i < dim; ++i) sum += a[i] * b[i];
+  return -sum;  // negate so lower is better
+}
+
+using DistFn = float(*)(const float*, const float*, u32);
+
+// ============================================================================
+// CPU Vamana graph builder
+// ============================================================================
+
+struct VamanaGraph {
+  size_t num_nodes{0};
+  u32 dim{0};
+  u32 R{0};            // max out-degree
+  size_t medoid{0};    // medoid node index
+
+  // Adjacency lists: neighbors[i] = list of neighbor indices for node i
+  vec<vec<u32>> neighbors;
+  // Per-node mutex for concurrent reverse-edge updates
+  vec<std::mutex> node_locks;
+
+  void init(size_t n, u32 d, u32 max_degree) {
+    num_nodes = n;
+    dim = d;
+    R = max_degree;
+    neighbors.resize(n);
+    node_locks = vec<std::mutex>(n);
+  }
+};
+
+/**
+ * Compute medoid: the vector with minimum sum of distances to all others.
+ * Uses sampling for large datasets.
+ */
+size_t compute_medoid(const Dataset& dataset, DistFn dist_fn) {
+  const size_t n = dataset.ids.size();
+  const u32 dim = dataset.dim;
+
+  // For large datasets, sample to find approximate medoid
+  const size_t sample_size = std::min<size_t>(n, 10000);
+  vec<size_t> sample_indices(n);
+  std::iota(sample_indices.begin(), sample_indices.end(), 0);
+
+  if (sample_size < n) {
+    std::mt19937 rng(42);
+    std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
+    sample_indices.resize(sample_size);
+  }
+
+  // Compute centroid
+  vec<float> centroid(dim, 0.0f);
+  for (size_t idx : sample_indices) {
+    const float* v = dataset.vector(idx);
+    for (u32 d = 0; d < dim; ++d) centroid[d] += v[d];
+  }
+  for (u32 d = 0; d < dim; ++d) centroid[d] /= static_cast<float>(sample_size);
+
+  // Find vector closest to centroid
+  size_t best = 0;
+  float best_dist = std::numeric_limits<float>::max();
+  for (size_t i = 0; i < n; ++i) {
+    float d = dist_fn(dataset.vector(i), centroid.data(), dim);
+    if (d < best_dist) {
+      best_dist = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * Beam search from medoid to find nearest candidates for a query vector.
+ * Returns a sorted list of (distance, node_index) pairs.
+ */
+vec<std::pair<float, u32>> beam_search(const VamanaGraph& graph,
+                                       const Dataset& dataset,
+                                       const float* query,
+                                       u32 beam_width,
+                                       DistFn dist_fn) {
+  const u32 dim = dataset.dim;
+
+  // Candidate beam: (distance, node_index), sorted by distance
+  vec<std::pair<float, u32>> beam;
+  std::unordered_set<u32> visited;
+
+  // Start from medoid
+  float medoid_dist = dist_fn(query, dataset.vector(graph.medoid), dim);
+  beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
+  visited.insert(static_cast<u32>(graph.medoid));
+
+  size_t expand_idx = 0;  // next unexpanded entry in beam
+
+  while (expand_idx < beam.size()) {
+    // Pick closest unexpanded
+    u32 best_node = beam[expand_idx].second;
+    ++expand_idx;
+
+    // Expand neighbors
+    const auto& nbrs = graph.neighbors[best_node];
+    for (u32 nbr : nbrs) {
+      if (visited.count(nbr)) continue;
+      visited.insert(nbr);
+
+      float d = dist_fn(query, dataset.vector(nbr), dim);
+      beam.push_back({d, nbr});
+    }
+
+    // Sort and trim to beam_width
+    std::sort(beam.begin(), beam.end());
+    if (beam.size() > beam_width) {
+      beam.resize(beam_width);
+      // Recompute expand_idx: find first unexpanded after resize
+      // All entries before expand_idx were already expanded
+      // But some of them might have been trimmed, so reset
+    }
+  }
+
+  std::sort(beam.begin(), beam.end());
+  return beam;
+}
+
+/**
+ * RobustPrune: select up to R diverse neighbors from sorted candidates.
+ *
+ * For each candidate p* (in order of increasing distance from source):
+ *   Accept p* unless there exists an already-selected p' such that
+ *   alpha * dist(p*, p') <= dist(source, p*)
+ */
+vec<u32> robust_prune(const Dataset& dataset,
+                      u32 source,
+                      const vec<std::pair<float, u32>>& sorted_candidates,
+                      float alpha,
+                      u32 R,
+                      DistFn dist_fn) {
+  const u32 dim = dataset.dim;
+  vec<u32> selected;
+  selected.reserve(R);
+
+  for (const auto& [cand_dist, cand_id] : sorted_candidates) {
+    if (cand_id == source) continue;
+    if (selected.size() >= R) break;
+
+    bool pruned = false;
+    for (u32 sel_id : selected) {
+      float d_sel_cand = dist_fn(dataset.vector(sel_id), dataset.vector(cand_id), dim);
+      if (alpha * d_sel_cand <= cand_dist) {
+        pruned = true;
+        break;
+      }
+    }
+
+    if (!pruned) {
+      selected.push_back(cand_id);
+    }
+  }
+
+  return selected;
+}
+
+/**
+ * Build the Vamana graph using sequential insertion.
+ *
+ * Algorithm from DiskANN paper:
+ *   1. Compute medoid
+ *   2. Insert vectors in random order
+ *   3. For each vector: beam search → RobustPrune → add edges + reverse edges
+ */
+void build_vamana_graph(VamanaGraph& graph,
+                        const Dataset& dataset,
+                        const VamanaBuildConfig& config,
+                        DistFn dist_fn) {
+  const size_t n = dataset.ids.size();
+  const u32 dim = dataset.dim;
+  const u32 R = config.R;
+  const float alpha = static_cast<float>(config.alpha);
+  const u32 beam_width = config.beam_width;
+
+  graph.init(n, dim, R);
+
+  // Compute medoid
+  std::cerr << "computing medoid...\n";
+  graph.medoid = compute_medoid(dataset, dist_fn);
+  std::cerr << "medoid: node " << graph.medoid << "\n";
+
+  // Random insertion order
+  vec<size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  const size_t seed = config.seed == -1 ? std::random_device{}() : static_cast<size_t>(config.seed);
+  std::mt19937 rng(seed);
+  std::shuffle(order.begin(), order.end(), rng);
+
+  // Insert first node (medoid gets no neighbors initially, others search from it)
+  ProgressReporter progress{"Building Vamana graph", n};
+
+  for (size_t step = 0; step < n; ++step) {
+    const size_t node_idx = order[step];
+
+    if (step == 0) {
+      // First node: no neighbors to find
+      progress.increment();
+      continue;
+    }
+
+    // Beam search to find candidate neighbors
+    const float* query = dataset.vector(node_idx);
+    auto candidates = beam_search(graph, dataset, query, beam_width, dist_fn);
+
+    // RobustPrune to select forward neighbors
+    vec<u32> new_neighbors = robust_prune(
+        dataset, static_cast<u32>(node_idx), candidates, alpha, R, dist_fn);
+
+    // Set forward edges
+    graph.neighbors[node_idx] = new_neighbors;
+
+    // Add reverse edges (bidirectional connectivity)
+    for (u32 nbr : new_neighbors) {
+      auto& nbr_list = graph.neighbors[nbr];
+
+      if (nbr_list.size() < R) {
+        // Simply add reverse edge
+        bool already_present = false;
+        for (u32 existing : nbr_list) {
+          if (existing == static_cast<u32>(node_idx)) {
+            already_present = true;
+            break;
+          }
+        }
+        if (!already_present) {
+          nbr_list.push_back(static_cast<u32>(node_idx));
+        }
+      } else {
+        // Need to prune: collect current neighbors + new node as candidates
+        vec<std::pair<float, u32>> prune_candidates;
+        prune_candidates.reserve(nbr_list.size() + 1);
+
+        const float* nbr_vec = dataset.vector(nbr);
+        for (u32 existing : nbr_list) {
+          float d = dist_fn(nbr_vec, dataset.vector(existing), dim);
+          prune_candidates.push_back({d, existing});
+        }
+        float d_new = dist_fn(nbr_vec, dataset.vector(node_idx), dim);
+        prune_candidates.push_back({d_new, static_cast<u32>(node_idx)});
+
+        std::sort(prune_candidates.begin(), prune_candidates.end());
+        nbr_list = robust_prune(dataset, nbr, prune_candidates, alpha, R, dist_fn);
+      }
+    }
+
+    progress.increment();
+  }
+
+  progress.finish();
+
+  // Print graph stats
+  size_t total_edges = 0;
+  size_t max_edges = 0;
+  size_t min_edges = std::numeric_limits<size_t>::max();
+  for (size_t i = 0; i < n; ++i) {
+    total_edges += graph.neighbors[i].size();
+    max_edges = std::max(max_edges, graph.neighbors[i].size());
+    min_edges = std::min(min_edges, graph.neighbors[i].size());
+  }
+  std::cerr << "graph stats: avg_degree=" << (static_cast<double>(total_edges) / n)
+            << " max=" << max_edges << " min=" << min_edges << "\n";
+}
+
+// ============================================================================
+// RaBitQ quantization (CPU)
+// ============================================================================
+
+struct RaBitQState {
+  Eigen::MatrixXf rotation_matrix;  // dim x dim, column-major
+  vec<float> rotated_centroid;       // dim
+  double t_const{0.0};              // scaling constant
+  u32 dim{0};
+  u32 bits_per_dim{0};
+  u32 packed_bytes{0};              // (bits_per_dim * dim + 7) / 8
+  u32 total_rabitq_bytes{0};        // packed_bytes + 8 (add + rescale)
+};
+
+/**
+ * Initialize RaBitQ: generate random orthogonal matrix via QR decomposition.
+ */
+RaBitQState init_rabitq(const Dataset& dataset, u32 bits_per_dim, int seed) {
+  const u32 dim = dataset.dim;
+  const size_t n = dataset.ids.size();
+
+  RaBitQState state;
+  state.dim = dim;
+  state.bits_per_dim = bits_per_dim;
+  state.packed_bytes = (bits_per_dim * dim + 7) / 8;
+  state.total_rabitq_bytes = state.packed_bytes + 2 * sizeof(float);
+
+  // Generate random matrix and compute QR decomposition for orthogonal P
+  std::cerr << "generating rotation matrix (dim=" << dim << ")...\n";
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+
+  Eigen::MatrixXf random_mat(dim, dim);
+  for (u32 i = 0; i < dim; ++i)
+    for (u32 j = 0; j < dim; ++j)
+      random_mat(i, j) = normal(rng);
+
+  Eigen::HouseholderQR<Eigen::MatrixXf> qr(random_mat);
+  state.rotation_matrix = qr.householderQ() * Eigen::MatrixXf::Identity(dim, dim);
+
+  // Compute centroid
+  std::cerr << "computing centroid...\n";
+  Eigen::VectorXf centroid = Eigen::VectorXf::Zero(dim);
+  for (size_t i = 0; i < n; ++i) {
+    Eigen::Map<const Eigen::VectorXf> v(dataset.vector(i), dim);
+    centroid += v;
+  }
+  centroid /= static_cast<float>(n);
+
+  // Rotate centroid
+  Eigen::VectorXf rot_centroid = state.rotation_matrix.transpose() * centroid;
+  state.rotated_centroid.assign(rot_centroid.data(), rot_centroid.data() + dim);
+
+  // Compute t_const: expected norm of quantization for the given bits
+  // For 1-bit: t = 1/sqrt(dim), for multi-bit: t = (2^bits - 1) / (2 * sqrt(dim))
+  const u32 num_levels = (1u << bits_per_dim) - 1;
+  state.t_const = static_cast<double>(num_levels) / (2.0 * std::sqrt(static_cast<double>(dim)));
+
+  return state;
+}
+
+/**
+ * Quantize a single vector using RaBitQ.
+ * Output: [packed_bits(packed_bytes) | add(4B) | rescale(4B)]
+ */
+void rabitq_quantize_vector(const float* vector,
+                            const RaBitQState& state,
+                            byte_t* output) {
+  const u32 dim = state.dim;
+  const u32 bits = state.bits_per_dim;
+
+  // Rotate vector: x' = P^T * x
+  Eigen::Map<const Eigen::VectorXf> v(vector, dim);
+  Eigen::VectorXf rotated = state.rotation_matrix.transpose() * v;
+
+  // Subtract rotated centroid: delta = x' - c'
+  vec<float> delta(dim);
+  for (u32 i = 0; i < dim; ++i)
+    delta[i] = rotated(i) - state.rotated_centroid[i];
+
+  // Compute norm of delta
+  float delta_norm = 0.0f;
+  for (u32 i = 0; i < dim; ++i) delta_norm += delta[i] * delta[i];
+  delta_norm = std::sqrt(delta_norm);
+
+  // Normalize delta
+  vec<float> normalized(dim);
+  if (delta_norm > 1e-12f) {
+    for (u32 i = 0; i < dim; ++i) normalized[i] = delta[i] / delta_norm;
+  }
+
+  // Quantize to bits_per_dim bits
+  // 1-bit: sign quantization: 0 if < 0, 1 if >= 0
+  // multi-bit: uniform quantization of [-1, 1] to [0, 2^bits-1]
+  const u32 num_levels = (1u << bits) - 1;
+  vec<u8> quantized_vals(dim);
+
+  float sum_quantized = 0.0f;  // sum of quantized values (for add factor)
+  for (u32 i = 0; i < dim; ++i) {
+    if (bits == 1) {
+      quantized_vals[i] = (normalized[i] >= 0.0f) ? 1 : 0;
+    } else {
+      // Map [-1, 1] to [0, num_levels]
+      float clamped = std::clamp(normalized[i], -1.0f, 1.0f);
+      float scaled = (clamped + 1.0f) * 0.5f * static_cast<float>(num_levels);
+      quantized_vals[i] = static_cast<u8>(std::round(scaled));
+    }
+    sum_quantized += static_cast<float>(quantized_vals[i]);
+  }
+
+  // Pack bits into bytes
+  std::memset(output, 0, state.packed_bytes);
+  if (bits == 1) {
+    for (u32 i = 0; i < dim; ++i) {
+      if (quantized_vals[i]) {
+        output[i / 8] |= (1 << (i % 8));
+      }
+    }
+  } else if (bits == 2) {
+    for (u32 i = 0; i < dim; ++i) {
+      output[i / 4] |= (quantized_vals[i] & 0x3) << ((i % 4) * 2);
+    }
+  } else if (bits == 4) {
+    for (u32 i = 0; i < dim; ++i) {
+      output[i / 2] |= (quantized_vals[i] & 0xF) << ((i % 2) * 4);
+    }
+  } else {  // 8 bits
+    for (u32 i = 0; i < dim; ++i) {
+      output[i] = quantized_vals[i];
+    }
+  }
+
+  // Compute add and rescale factors
+  // add = sum_quantized / dim  (for bias correction in distance estimation)
+  // rescale = delta_norm (for scaling back to original distances)
+  float add_factor = sum_quantized / static_cast<float>(dim);
+  float rescale_factor = delta_norm;
+
+  byte_t* trailer = output + state.packed_bytes;
+  std::memcpy(trailer, &add_factor, sizeof(float));
+  std::memcpy(trailer + sizeof(float), &rescale_factor, sizeof(float));
+}
+
+// ============================================================================
+// Shard serialization
+// ============================================================================
+
+struct NodePlacement {
+  u32 memory_node{0};
+  u64 offset{0};
+};
+
+/**
+ * Assign nodes to memory node shards using round-robin offset balancing.
+ */
+vec<NodePlacement> assign_nodes_to_shards(size_t num_vectors, u32 num_memory_nodes) {
+  const size_t node_size = VamanaNode::total_size();
+  // Align to 8 bytes
+  const size_t aligned_size = (node_size + 7) & ~7ULL;
+
+  vec<u64> shard_offsets(num_memory_nodes, 16);  // reserve 16B header: [free_ptr | medoid_ptr]
+  vec<NodePlacement> placements(num_vectors);
+
+  for (size_t i = 0; i < num_vectors; ++i) {
+    // Pick shard with least data
+    const auto min_it = std::min_element(shard_offsets.begin(), shard_offsets.end());
+    const u32 shard = static_cast<u32>(std::distance(shard_offsets.begin(), min_it));
+
+    placements[i] = {shard, *min_it};
+    *min_it += aligned_size;
+  }
+
+  return placements;
+}
+
+void write_vamana_shards(const VamanaGraph& graph,
+                         const Dataset& dataset,
+                         const VamanaBuildConfig& config,
+                         const RaBitQState& rabitq_state,
+                         const vec<vec<byte_t>>& rabitq_data,
+                         const filepath_t& output_prefix) {
+  const size_t n = dataset.ids.size();
+  const u32 dim = dataset.dim;
+  const size_t node_size = VamanaNode::total_size();
+  const size_t aligned_size = (node_size + 7) & ~7ULL;
+
+  ProgressReporter progress{"Exporting Vamana shards", n + config.num_memory_nodes};
+
+  const auto placements = assign_nodes_to_shards(n, config.num_memory_nodes);
+
+  // Compute shard sizes
+  vec<u64> shard_sizes(config.num_memory_nodes, 16);
+  for (const auto& p : placements) {
+    shard_sizes[p.memory_node] = std::max<u64>(shard_sizes[p.memory_node], p.offset + aligned_size);
+  }
+
+  // Allocate shard buffers
+  vec<vec<byte_t>> shard_buffers(config.num_memory_nodes);
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
+    shard_buffers[shard].assign(shard_sizes[shard], 0);
+    // Write free_ptr at offset 0 (points past last node)
+    *reinterpret_cast<u64*>(shard_buffers[shard].data()) = shard_sizes[shard];
+  }
+
+  // Write medoid_ptr at offset 8 on shard 0
+  const RemotePtr medoid_ptr{placements[graph.medoid].memory_node, placements[graph.medoid].offset};
+  *reinterpret_cast<u64*>(shard_buffers[0].data() + 8) = medoid_ptr.raw_address;
+
+  // Serialize each node
+  for (size_t i = 0; i < n; ++i) {
+    const auto& placement = placements[i];
+    byte_t* buf = shard_buffers[placement.memory_node].data() + placement.offset;
+
+    // Header (8B)
+    u64 header = 0;
+    if (i == graph.medoid) header |= VamanaNode::HEADER_IS_MEDOID;
+    *reinterpret_cast<u64*>(buf) = header;
+
+    // ID (4B)
+    *reinterpret_cast<u32*>(buf + VamanaNode::HEADER_SIZE) = dataset.ids[i];
+
+    // Edge count (1B)
+    const u8 edge_count = static_cast<u8>(std::min<size_t>(graph.neighbors[i].size(), config.R));
+    *reinterpret_cast<u8*>(buf + VamanaNode::offset_edge_count()) = edge_count;
+
+    // Padding (3B) - already zeroed
+
+    // Vector (dim * 4B)
+    std::memcpy(buf + VamanaNode::offset_vector(),
+                dataset.vector(i),
+                dim * sizeof(float));
+
+    // RaBitQ data
+    std::memcpy(buf + VamanaNode::offset_rabitq(),
+                rabitq_data[i].data(),
+                rabitq_state.total_rabitq_bytes);
+
+    // Neighbors (R * 8B) — write active + zero rest
+    auto* neighbor_buf = reinterpret_cast<u64*>(buf + VamanaNode::offset_neighbors());
+    for (u8 j = 0; j < edge_count; ++j) {
+      const u32 nbr = graph.neighbors[i][j];
+      RemotePtr nbr_ptr{placements[nbr].memory_node, placements[nbr].offset};
+      neighbor_buf[j] = nbr_ptr.raw_address;
+    }
+    // Remaining slots already zeroed
+
+    progress.increment();
+  }
+
+  // Write shard files
+  const filepath_t output_dir = output_prefix.parent_path();
+  if (!output_dir.empty()) {
+    std::filesystem::create_directories(output_dir);
+  }
+
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
+    const filepath_t shard_file = index_path::shard_file(output_prefix, shard + 1, config.num_memory_nodes);
+    std::ofstream output(shard_file, std::ios::binary | std::ios::out);
+    lib_assert(output.good(), "failed to open output shard file: " + shard_file.string());
+    output.write(reinterpret_cast<const char*>(shard_buffers[shard].data()),
+                 static_cast<std::streamsize>(shard_buffers[shard].size()));
+    lib_assert(output.good(), "failed to write output shard file: " + shard_file.string());
+    progress.increment();
+  }
+
+  // Write rotation matrix to a separate file
+  {
+    const filepath_t rot_file = filepath_t(output_prefix.string() + ".rotation.bin");
+    std::ofstream out(rot_file, std::ios::binary);
+    lib_assert(out.good(), "failed to open rotation matrix file: " + rot_file.string());
+    // Write dim, then column-major matrix data
+    u32 d = dim;
+    out.write(reinterpret_cast<const char*>(&d), sizeof(u32));
+    out.write(reinterpret_cast<const char*>(rabitq_state.rotation_matrix.data()),
+              static_cast<std::streamsize>(dim * dim * sizeof(float)));
+    // Write rotated centroid
+    out.write(reinterpret_cast<const char*>(rabitq_state.rotated_centroid.data()),
+              static_cast<std::streamsize>(dim * sizeof(float)));
+    // Write t_const
+    double tc = rabitq_state.t_const;
+    out.write(reinterpret_cast<const char*>(&tc), sizeof(double));
+    lib_assert(out.good(), "failed to write rotation matrix file");
+  }
+
+  // Write metadata
+  nlohmann::json metadata{
+    {"data_file", dataset.source_file.string()},
+    {"output_prefix", output_prefix.string()},
+    {"distance", config.ip_distance ? "ip" : "l2"},
+    {"num_vectors", n},
+    {"dim", dim},
+    {"R", config.R},
+    {"beam_width", config.beam_width},
+    {"alpha", config.alpha},
+    {"rabitq_bits", config.rabitq_bits},
+    {"num_memory_nodes", config.num_memory_nodes},
+    {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
+    {"node_size", node_size},
+    {"rabitq_size", rabitq_state.total_rabitq_bytes},
+  };
+
+  const filepath_t metadata_file = filepath_t(output_prefix.string() + ".meta.json");
+  std::ofstream metadata_output(metadata_file);
+  metadata_output << std::setw(2) << metadata << std::endl;
+  progress.finish();
+}
+
+// ============================================================================
+// CLI parsing
+// ============================================================================
+
+filepath_t default_vamana_prefix(const filepath_t& data_path, u32 R, u32 beam_width) {
+  const filepath_t base = std::filesystem::is_regular_file(data_path) ? data_path.parent_path() : data_path;
+  return base / "dump" / ("vamana_R" + std::to_string(R) + "_bw" + std::to_string(beam_width));
+}
+
+VamanaBuildConfig parse_configuration(int argc, char** argv) {
+  VamanaBuildConfig config;
+
+  po::options_description desc{"Vamana offline builder options"};
+  desc.add_options()
+    ("help,h", "Show help message")
+    ("data-path,d", po::value<filepath_t>(&config.data_path), "Path to a dataset file or directory.")
+    ("output-prefix,o", po::value<filepath_t>(&config.output_prefix),
+     "Output prefix without _nodeX_ofN.dat suffix.")
+    ("memory-nodes,n", po::value<u32>(&config.num_memory_nodes)->default_value(config.num_memory_nodes),
+     "Number of output shards / memory nodes.")
+    ("threads,t", po::value<u32>(&config.threads)->default_value(config.threads),
+     "Number of threads. 0 = hardware concurrency.")
+    ("R", po::value<u32>(&config.R)->default_value(config.R), "Maximum out-degree.")
+    ("beam-width", po::value<u32>(&config.beam_width)->default_value(config.beam_width),
+     "Beam width for search during construction.")
+    ("alpha", po::value<f64>(&config.alpha)->default_value(config.alpha), "RobustPrune alpha parameter.")
+    ("rabitq-bits", po::value<u32>(&config.rabitq_bits)->default_value(config.rabitq_bits),
+     "Bits per dimension for RaBitQ (1, 2, 4, or 8).")
+    ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
+    ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
+     "Maximum number of vectors to read.")
+    ("ip-dist", po::bool_switch(&config.ip_distance), "Use inner-product distance instead of L2.");
+
+  po::variables_map vm;
+  po::store(po::parse_command_line(argc, argv, desc), vm);
+
+  if (vm.count("help")) {
+    std::cerr << desc << std::endl;
+    std::exit(EXIT_SUCCESS);
+  }
+
+  po::notify(vm);
+
+  if (config.data_path.empty()) lib_failure("--data-path is required");
+  if (config.num_memory_nodes == 0) lib_failure("--memory-nodes must be > 0");
+  if (config.R == 0) lib_failure("--R must be > 0");
+  if (config.rabitq_bits != 1 && config.rabitq_bits != 2 &&
+      config.rabitq_bits != 4 && config.rabitq_bits != 8)
+    lib_failure("--rabitq-bits must be 1, 2, 4, or 8");
+
+  return config;
+}
+
+}  // namespace
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char** argv) {
+  const VamanaBuildConfig config = parse_configuration(argc, argv);
+  const Dataset dataset = read_dataset(config);
+  const filepath_t output_prefix =
+      config.output_prefix.empty()
+          ? default_vamana_prefix(dataset.source_file, config.R, config.beam_width)
+          : config.output_prefix;
+
+  std::cerr << "output prefix: " << output_prefix << "\n";
+  std::cerr << "memory nodes: " << config.num_memory_nodes << "\n";
+  std::cerr << "threads: " << effective_thread_count(config.threads) << "\n";
+  std::cerr << "R=" << config.R << " beam_width=" << config.beam_width
+            << " alpha=" << config.alpha << " rabitq_bits=" << config.rabitq_bits << "\n";
+
+  const auto build_start = std::chrono::steady_clock::now();
+
+  // Initialize VamanaNode static storage
+  VamanaNode::init_static_storage(dataset.dim, config.R, config.rabitq_bits);
+
+  // Select distance function
+  DistFn dist_fn = config.ip_distance ? ip_distance : l2_squared;
+
+  // Step 1: Build Vamana graph
+  VamanaGraph graph;
+  build_vamana_graph(graph, dataset, config, dist_fn);
+
+  // Step 2: Initialize RaBitQ and quantize all vectors
+  RaBitQState rabitq_state = init_rabitq(dataset, config.rabitq_bits, config.seed);
+
+  vec<vec<byte_t>> rabitq_data(dataset.ids.size());
+  {
+    ProgressReporter progress{"Quantizing vectors (RaBitQ)", dataset.ids.size()};
+    parallel_for(0, dataset.ids.size(), config.threads,
+                 [&](size_t i, size_t) {
+                   rabitq_data[i].resize(rabitq_state.total_rabitq_bytes);
+                   rabitq_quantize_vector(dataset.vector(i), rabitq_state, rabitq_data[i].data());
+                   progress.increment();
+                 });
+    progress.finish();
+  }
+
+  // Step 3: Serialize to shard files
+  write_vamana_shards(graph, dataset, config, rabitq_state, rabitq_data, output_prefix);
+
+  const auto build_end = std::chrono::steady_clock::now();
+  const auto seconds = std::chrono::duration_cast<std::chrono::duration<double>>(build_end - build_start).count();
+  std::cerr << "offline build finished in " << seconds << " seconds\n";
+
+  return EXIT_SUCCESS;
+}
