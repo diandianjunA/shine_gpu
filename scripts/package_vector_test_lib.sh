@@ -21,17 +21,17 @@ if [[ -z "$RUNTIME_LIB" || -z "$GPU_KERNELS_LIB" || -z "$RDMA_LIB" ]]; then
     exit 1
 fi
 
-mkdir -p "$DEST_DIR/lib" "$DEST_DIR/include/shine"
-rm -rf "$DEST_DIR/include/shine/src" \
-       "$DEST_DIR/include/shine/rdma-library" \
-       "$DEST_DIR/include/shine/thirdparty"
+mkdir -p "$DEST_DIR/lib" "$DEST_DIR/include/shine_gpu"
+rm -rf "$DEST_DIR/include/shine_gpu/src" \
+       "$DEST_DIR/include/shine_gpu/rdma-library" \
+       "$DEST_DIR/include/shine_gpu/thirdparty"
 
 cp "$RUNTIME_LIB" "$DEST_DIR/lib/libshine_runtime.a"
 cp "$GPU_KERNELS_LIB" "$DEST_DIR/lib/libshine_gpu_kernels.a"
 cp "$RDMA_LIB" "$DEST_DIR/lib/librdma_library.a"
-cp -r "$PROJECT_DIR/src" "$DEST_DIR/include/shine/src"
-cp -r "$PROJECT_DIR/rdma-library" "$DEST_DIR/include/shine/rdma-library"
-cp -r "$PROJECT_DIR/thirdparty" "$DEST_DIR/include/shine/thirdparty"
-rm -rf "$DEST_DIR/include/shine/thirdparty/httplib"
+cp -r "$PROJECT_DIR/src" "$DEST_DIR/include/shine_gpu/src"
+cp -r "$PROJECT_DIR/rdma-library" "$DEST_DIR/include/shine_gpu/rdma-library"
+cp -r "$PROJECT_DIR/thirdparty" "$DEST_DIR/include/shine_gpu/thirdparty"
+rm -rf "$DEST_DIR/include/shine_gpu/thirdparty/httplib"
 
 echo "packaged SHINE GPU runtime into $DEST_DIR"
