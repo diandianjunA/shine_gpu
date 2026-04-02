@@ -47,6 +47,7 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMallocHost(&s.h_rabitq_vecs, max_batch * rabitq_vec_size_));
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_vecs, max_batch * dim * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_dists, max_batch * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&s.h_candidate_order, max_batch * sizeof(uint32_t)));
         CUDA_CHECK(cudaMallocHost(&s.h_distances, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_count, sizeof(uint32_t)));
@@ -57,6 +58,7 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMalloc(&s.d_rabitq_vecs, max_batch * rabitq_vec_size_));
         CUDA_CHECK(cudaMalloc(&s.d_candidate_vecs, max_batch * dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&s.d_candidate_dists, max_batch * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&s.d_candidate_order, max_batch * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_distances, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_count, sizeof(uint32_t)));
@@ -95,6 +97,7 @@ void GpuBufferManager::destroy() {
         if (s.d_rabitq_vecs) cudaFree(s.d_rabitq_vecs);
         if (s.d_candidate_vecs) cudaFree(s.d_candidate_vecs);
         if (s.d_candidate_dists) cudaFree(s.d_candidate_dists);
+        if (s.d_candidate_order) cudaFree(s.d_candidate_order);
         if (s.d_distances) cudaFree(s.d_distances);
         if (s.d_pruned_indices) cudaFree(s.d_pruned_indices);
         if (s.d_pruned_count) cudaFree(s.d_pruned_count);
@@ -106,6 +109,7 @@ void GpuBufferManager::destroy() {
         if (s.h_rabitq_vecs) cudaFreeHost(s.h_rabitq_vecs);
         if (s.h_candidate_vecs) cudaFreeHost(s.h_candidate_vecs);
         if (s.h_candidate_dists) cudaFreeHost(s.h_candidate_dists);
+        if (s.h_candidate_order) cudaFreeHost(s.h_candidate_order);
         if (s.h_distances) cudaFreeHost(s.h_distances);
         if (s.h_pruned_indices) cudaFreeHost(s.h_pruned_indices);
         if (s.h_pruned_count) cudaFreeHost(s.h_pruned_count);

@@ -364,6 +364,7 @@ public:
             gs.d_query,  // source vector (the new node being inserted)
             gs.d_candidate_vecs,
             gs.d_candidate_dists,
+            nullptr,
             n_candidates, dim_, alpha_, R_,
             gs.d_pruned_indices, gs.d_pruned_count);
         co_await gpu::GpuAwaitable{thread.get()};
@@ -495,35 +496,27 @@ public:
                     // Copy sorted distances
                     // We can reuse h_candidate_dists as temp
                     gs.h_candidate_dists[i] = idx_dist[i].second;
+                    gs.h_candidate_order[i] = idx_dist[i].first;
                 }
 
-                // Reupload sorted distances
+                // Upload sorted distances and the corresponding original candidate order.
                 cudaMemcpyAsync(gs.d_candidate_dists, gs.h_candidate_dists,
                                n_all * sizeof(float),
                                cudaMemcpyHostToDevice, gs.stream);
-
-                // Reorder vectors in sorted order on host, then upload
-                // Use h_rabitq_vecs as temporary (large enough for vectors)
-                for (u32 i = 0; i < n_all; ++i) {
-                    u32 orig_idx = idx_dist[i].first;
-                    std::memcpy(gs.h_candidate_vecs + i * dim_,
-                               reinterpret_cast<float*>(all_vec_bufs[orig_idx]),
-                               dim_ * sizeof(float));
-                }
+                cudaMemcpyAsync(gs.d_candidate_order, gs.h_candidate_order,
+                               n_all * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, gs.stream);
 
                 for (u32 i = 0; i < n_all; ++i) {
                     thread->buffer_allocator.free_buffer(all_vec_bufs[i], dim_ * sizeof(element_t));
                 }
-
-                cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
-                               n_all * dim_ * sizeof(float),
-                               cudaMemcpyHostToDevice, gs.stream);
 
                 gpu::launch_robust_prune(
                     gs.stream, gs.event,
                     gs.d_query,
                     gs.d_candidate_vecs,
                     gs.d_candidate_dists,
+                    gs.d_candidate_order,
                     n_all, dim_, alpha_, R_,
                     gs.d_pruned_indices, gs.d_pruned_count);
                 co_await gpu::GpuAwaitable{thread.get()};
@@ -540,9 +533,7 @@ public:
                 vec<RemotePtr> pruned_neighbors;
                 pruned_neighbors.reserve(new_count);
                 for (u32 i = 0; i < new_count; ++i) {
-                    u32 sorted_idx = gs.h_pruned_indices[i];
-                    u32 orig_idx = idx_dist[sorted_idx].first;
-                    pruned_neighbors.push_back(all_candidate_ptrs[orig_idx]);
+                    pruned_neighbors.push_back(all_candidate_ptrs[gs.h_pruned_indices[i]]);
                 }
 
                 co_await rdma::vamana::write_vamana_neighbors(

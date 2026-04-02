@@ -65,6 +65,7 @@ void launch_batch_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
  * @param d_source_vec     Device pointer to source vertex vector (dim floats)
  * @param d_candidate_vecs Device pointer to candidate vectors (n_candidates * dim floats)
  * @param d_candidate_dists Device pointer to distances from source to candidates (sorted ascending)
+ * @param d_candidate_order Device pointer to candidate indices in sorted order, or nullptr for identity
  * @param n_candidates     Number of candidates
  * @param dim              Vector dimension
  * @param alpha            Diversity factor (typically 1.2)
@@ -76,6 +77,7 @@ void launch_robust_prune(cudaStream_t stream, cudaEvent_t event,
                          const float* d_source_vec,
                          const float* d_candidate_vecs,
                          const float* d_candidate_dists,
+                         const uint32_t* d_candidate_order,
                          uint32_t n_candidates, uint32_t dim,
                          float alpha, uint32_t R,
                          uint32_t* d_pruned_indices, uint32_t* d_pruned_count);

@@ -39,6 +39,7 @@ struct CoroutineGpuState {
     uint8_t*  h_rabitq_vecs{nullptr};    // [max_batch * rabitq_vec_size]
     float*    h_candidate_vecs{nullptr}; // [max_batch * dim] for prune
     float*    h_candidate_dists{nullptr};// [max_batch]
+    uint32_t* h_candidate_order{nullptr};// [max_batch]
     float*    h_distances{nullptr};      // [max_batch]
     uint32_t* h_pruned_indices{nullptr}; // [R]
     uint32_t* h_pruned_count{nullptr};   // [1]
@@ -49,6 +50,7 @@ struct CoroutineGpuState {
     uint8_t*  d_rabitq_vecs{nullptr};
     float*    d_candidate_vecs{nullptr};
     float*    d_candidate_dists{nullptr};
+    uint32_t* d_candidate_order{nullptr};
     float*    d_distances{nullptr};
     uint32_t* d_pruned_indices{nullptr};
     uint32_t* d_pruned_count{nullptr};

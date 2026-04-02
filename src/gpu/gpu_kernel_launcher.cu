@@ -131,6 +131,7 @@ void launch_robust_prune(cudaStream_t stream, cudaEvent_t event,
                          const float* d_source_vec,
                          const float* d_candidate_vecs,
                          const float* d_candidate_dists,
+                         const uint32_t* d_candidate_order,
                          uint32_t n_candidates, uint32_t dim,
                          float alpha, uint32_t R,
                          uint32_t* d_pruned_indices, uint32_t* d_pruned_count) {
@@ -146,7 +147,7 @@ void launch_robust_prune(cudaStream_t stream, cudaEvent_t event,
 
     gpu_kernels::robust_prune_kernel
         <<<1, block_size, smem_size, stream>>>(
-            d_source_vec, d_candidate_vecs, d_candidate_dists,
+            d_source_vec, d_candidate_vecs, d_candidate_dists, d_candidate_order,
             n_candidates, dim, alpha, R,
             d_pruned_indices, d_pruned_count);
 

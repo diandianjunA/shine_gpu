@@ -198,6 +198,7 @@ __global__ void robust_prune_kernel(
     const float* __restrict__ source_vec,    // [dim]
     const float* __restrict__ candidate_vecs,// [n_candidates * dim]
     const float* __restrict__ candidate_dists,// [n_candidates] sorted ascending
+    const uint32_t* __restrict__ candidate_order, // [n_candidates] or nullptr
     uint32_t n_candidates,
     uint32_t dim,
     float alpha,
@@ -226,7 +227,7 @@ __global__ void robust_prune_kernel(
     // Fast path: fewer candidates than R, just take them all
     if (n_candidates <= max_R) {
         for (uint32_t i = threadIdx.x; i < n_candidates; i += blockDim.x) {
-            pruned_indices[i] = i;
+            pruned_indices[i] = candidate_order ? candidate_order[i] : i;
         }
         if (threadIdx.x == 0) {
             *pruned_count = n_candidates;
@@ -242,7 +243,7 @@ __global__ void robust_prune_kernel(
         uint32_t selected_idx;
         if (threadIdx.x == 0) {
             selected_idx = write_idx;
-            pruned_indices[write_idx] = start;
+            pruned_indices[write_idx] = candidate_order ? candidate_order[start] : start;
             write_idx++;
         }
         __syncthreads();
@@ -250,7 +251,8 @@ __global__ void robust_prune_kernel(
         float dist_src_pstar = candidate_dists[start];
 
         // Check remaining candidates for redundancy (parallel)
-        const float* pstar_vec = candidate_vecs + start * dim;
+        const uint32_t pstar_idx = candidate_order ? candidate_order[start] : start;
+        const float* pstar_vec = candidate_vecs + pstar_idx * dim;
 
         for (uint32_t i = start + 1 + threadIdx.x; i < n_candidates; i += blockDim.x) {
             if (!is_valid[i]) continue;
@@ -258,7 +260,8 @@ __global__ void robust_prune_kernel(
             float dist_src_pprime = candidate_dists[i];
 
             // Compute dist(p*, p') -- distance between selected and candidate
-            const float* pprime_vec = candidate_vecs + i * dim;
+            const uint32_t pprime_idx = candidate_order ? candidate_order[i] : i;
+            const float* pprime_vec = candidate_vecs + pprime_idx * dim;
             float dist_pstar_pprime = 0.0f;
             for (uint32_t d = 0; d < dim; d++) {
                 float diff = pstar_vec[d] - pprime_vec[d];
