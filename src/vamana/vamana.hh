@@ -129,6 +129,7 @@ public:
                 std::memcpy(gs.h_candidate_vecs + i * dim_,
                            reinterpret_cast<float*>(vec_bufs[i]),
                            dim_ * sizeof(float));
+                thread->buffer_allocator.free_buffer(vec_bufs[i], dim_ * sizeof(element_t));
             }
 
             cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
@@ -302,6 +303,7 @@ public:
                 std::memcpy(gs.h_candidate_vecs + i * dim_,
                            reinterpret_cast<float*>(vec_bufs[i]),
                            dim_ * sizeof(float));
+                thread->buffer_allocator.free_buffer(vec_bufs[i], dim_ * sizeof(element_t));
             }
 
             cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
@@ -349,6 +351,7 @@ public:
                        reinterpret_cast<float*>(cand_vec_bufs[i]),
                        dim_ * sizeof(float));
             gs.h_candidate_dists[i] = beam[i].distance;
+            thread->buffer_allocator.free_buffer(cand_vec_bufs[i], dim_ * sizeof(element_t));
         }
 
         cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
@@ -508,6 +511,10 @@ public:
                     std::memcpy(gs.h_candidate_vecs + i * dim_,
                                reinterpret_cast<float*>(all_vec_bufs[orig_idx]),
                                dim_ * sizeof(float));
+                }
+
+                for (u32 i = 0; i < n_all; ++i) {
+                    thread->buffer_allocator.free_buffer(all_vec_bufs[i], dim_ * sizeof(element_t));
                 }
 
                 cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,

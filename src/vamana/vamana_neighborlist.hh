@@ -19,8 +19,8 @@ class ComputeThread;
 class VamanaNeighborlist {
 public:
   VamanaNeighborlist() = default;
-  VamanaNeighborlist(byte_t* buffer_ptr, ComputeThread* owner)
-      : buffer_slice_(buffer_ptr), owner_(owner) {}
+  VamanaNeighborlist(byte_t* buffer_ptr, size_t buffer_size, ComputeThread* owner)
+      : buffer_slice_(buffer_ptr), buffer_size_(buffer_size), owner_(owner) {}
 
   ~VamanaNeighborlist();
 
@@ -74,5 +74,6 @@ public:
 
 private:
   byte_t* buffer_slice_{};
+  size_t buffer_size_{};
   ComputeThread* owner_{};
 };

@@ -70,8 +70,8 @@ public:  // static storage
 
 public:  // member storage
   VamanaNode() = default;
-  VamanaNode(byte_t* buffer_ptr, const RemotePtr& rptr, ComputeThread* owner)
-      : owner_(owner), buffer_slice_(buffer_ptr), rptr(rptr) {}
+  VamanaNode(byte_t* buffer_ptr, size_t buffer_size, const RemotePtr& rptr, ComputeThread* owner)
+      : owner_(owner), buffer_slice_(buffer_ptr), buffer_size_(buffer_size), rptr(rptr) {}
 
   // Rule of 5: use shared_ptr for ownership, prevent copies/moves
   VamanaNode(const VamanaNode&) = delete;
@@ -156,6 +156,7 @@ public:  // member storage
 private:
   ComputeThread* owner_{};
   byte_t* buffer_slice_{};  // points to local buffer
+  size_t buffer_size_{};
 
 public:
   RemotePtr rptr;  // points to remote memory

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+
 #include "common/constants.hh"
 #include "vamana/vamana_node.hh"
 
@@ -15,23 +18,44 @@ public:
     local_buffer_.touch_memory();
 
     buffer_ptr_ = local_buffer_.get_full_buffer();
-
-    freelists_vamana_node_.resize(num_threads);
+    (void)num_threads;
   }
 
   HugePage<byte_t>& get_raw_buffer() { return local_buffer_; }
 
   // Allocate a buffer suitable for a full VamanaNode (including rabitq + neighbors)
   [[nodiscard]] byte_t* allocate_vamana_node(u32 thread_id) {
-    return get_free_space(VamanaNode::total_size(), freelists_vamana_node_[thread_id]);
+    (void)thread_id;
+    return allocate_buffer(VamanaNode::total_size());
   }
 
   // General-purpose allocation for buffers of arbitrary size
   [[nodiscard]] byte_t* allocate_buffer(size_t size) {
+    const size_t aligned_size = align(size);
+    byte_t* ptr = nullptr;
+
+    {
+      std::lock_guard<std::mutex> lock(freelist_mutex_);
+      auto it = freelists_by_size_.find(aligned_size);
+      if (it != freelists_by_size_.end() && it->second.try_dequeue(ptr)) {
+        return ptr;
+      }
+    }
+
     return allocate(size);
   }
 
   [[nodiscard]] u64* allocate_pointer() { return reinterpret_cast<u64*>(allocate(sizeof(u64))); }
+
+  void free_buffer(byte_t* ptr, size_t size) {
+    if (ptr == nullptr || size <= sizeof(u64)) {
+      return;
+    }
+
+    const size_t aligned_size = align(size);
+    std::lock_guard<std::mutex> lock(freelist_mutex_);
+    freelists_by_size_[aligned_size].enqueue(ptr);
+  }
 
   size_t allocated_memory() const { return bump_pointer_; }
 
@@ -42,16 +66,6 @@ private:
     }
 
     return size;
-  }
-
-  byte_t* get_free_space(size_t size, concurrent_queue<byte_t*>& freelist) {
-    byte_t* ptr;
-
-    if (!freelist.try_dequeue(ptr)) {
-      ptr = allocate(size);
-    }
-
-    return ptr;
   }
 
   byte_t* allocate(size_t size) {
@@ -73,9 +87,8 @@ private:
   std::atomic<idx_t> bump_pointer_{0};  // points to free space
   HugePage<byte_t> local_buffer_;
 
-  // freelists per thread (but other threads may append to them)
-  // this is significantly faster than having single global freelists
-  vec<concurrent_queue<byte_t*>> freelists_vamana_node_;
+  std::mutex freelist_mutex_;
+  std::unordered_map<size_t, concurrent_queue<byte_t*>> freelists_by_size_;
 
   concurrent_vec<byte_t*> allocated_buffers_;  // track valid pointers (for cache eviction)
 };
