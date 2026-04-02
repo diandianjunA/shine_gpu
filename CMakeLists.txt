@@ -99,7 +99,7 @@ if (SHINE_BUILD_EXECUTABLES)
         ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
     )
-    target_link_libraries(vamana_offline_builder rdma_library Eigen3::Eigen)
+    target_link_libraries(vamana_offline_builder rdma_library Eigen3::Eigen shine_gpu_kernels CUDA::cudart CUDA::cublas)
 endif ()
 
 if (SHINE_BUILD_TESTS)

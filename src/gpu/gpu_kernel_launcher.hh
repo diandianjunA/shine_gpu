@@ -133,4 +133,41 @@ void gpu_init(int device_id);
  */
 void gpu_shutdown();
 
+// =========================================================================
+// GPU memory management utilities (usable from host code without cuda_runtime.h)
+// =========================================================================
+
+/** Allocate device memory (cudaMalloc). */
+void* gpu_malloc(size_t bytes);
+
+/** Free device memory (cudaFree). */
+void gpu_free(void* ptr);
+
+/** Allocate page-locked host memory (cudaMallocHost). */
+void* gpu_malloc_host(size_t bytes);
+
+/** Free page-locked host memory (cudaFreeHost). */
+void gpu_free_host(void* ptr);
+
+/** Create a CUDA stream. */
+cudaStream_t gpu_stream_create();
+
+/** Destroy a CUDA stream. */
+void gpu_stream_destroy(cudaStream_t stream);
+
+/** Create a CUDA event. */
+cudaEvent_t gpu_event_create();
+
+/** Destroy a CUDA event. */
+void gpu_event_destroy(cudaEvent_t event);
+
+/** Async host-to-device memcpy. */
+void gpu_memcpy_h2d_async(void* dst, const void* src, size_t bytes, cudaStream_t stream);
+
+/** Async device-to-host memcpy. */
+void gpu_memcpy_d2h_async(void* dst, const void* src, size_t bytes, cudaStream_t stream);
+
+/** Synchronize a CUDA stream. */
+void gpu_stream_synchronize(cudaStream_t stream);
+
 }  // namespace gpu
