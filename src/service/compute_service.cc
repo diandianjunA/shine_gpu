@@ -464,16 +464,23 @@ void ComputeService<Distance>::start_workers() {
   const u32 num_threads = config_.num_threads;
   const u32 num_coroutines = config_.num_coroutines;
   const u32 dim = config_.dim;
+  const u32 num_insert_workers =
+      num_threads <= 1 ? 1 : std::clamp<u32>(num_threads / 2, 1, num_threads - 1);
+  const u32 num_query_workers = num_threads - num_insert_workers;
 
   print_status("starting " + std::to_string(num_threads) + " service worker threads (Vamana)");
+  print_status("worker split: inserts=" + std::to_string(num_insert_workers) +
+               ", queries=" + std::to_string(num_query_workers));
   workers_.reserve(num_threads);
 
-  workers_.emplace_back([this, num_coroutines, dim]() {
-    service::vamana_service_schedule_inserts<Distance>(
-      *vamana_, insert_queue_, shutdown_, num_coroutines, compute_threads()[0], dim, workers_paused_, workers_idle_count_);
-  });
+  for (u32 tid = 0; tid < num_insert_workers; ++tid) {
+    workers_.emplace_back([this, num_coroutines, dim, tid]() {
+      service::vamana_service_schedule_inserts<Distance>(
+        *vamana_, insert_queue_, shutdown_, num_coroutines, compute_threads()[tid], dim, workers_paused_, workers_idle_count_);
+    });
+  }
 
-  for (u32 tid = 1; tid < num_threads; ++tid) {
+  for (u32 tid = num_insert_workers; tid < num_threads; ++tid) {
     workers_.emplace_back([this, num_coroutines, dim, tid]() {
       service::vamana_service_schedule_queries<Distance>(
         *vamana_, query_queue_, shutdown_, num_coroutines, compute_threads()[tid], dim, workers_paused_, workers_idle_count_);
