@@ -262,4 +262,60 @@ void launch_rabitq_query_prepare(cudaStream_t stream, cudaEvent_t event,
     CUDA_CHECK(cudaEventRecord(event, stream));
 }
 
+// =============================================================================
+// GPU Memory Management Utilities
+// =============================================================================
+
+void* gpu_malloc(size_t bytes) {
+    void* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, bytes));
+    return ptr;
+}
+
+void gpu_free(void* ptr) {
+    if (ptr) CUDA_CHECK(cudaFree(ptr));
+}
+
+void* gpu_malloc_host(size_t bytes) {
+    void* ptr = nullptr;
+    CUDA_CHECK(cudaMallocHost(&ptr, bytes));
+    return ptr;
+}
+
+void gpu_free_host(void* ptr) {
+    if (ptr) CUDA_CHECK(cudaFreeHost(ptr));
+}
+
+cudaStream_t gpu_stream_create() {
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    return stream;
+}
+
+void gpu_stream_destroy(cudaStream_t stream) {
+    if (stream) CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+cudaEvent_t gpu_event_create() {
+    cudaEvent_t event = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    return event;
+}
+
+void gpu_event_destroy(cudaEvent_t event) {
+    if (event) CUDA_CHECK(cudaEventDestroy(event));
+}
+
+void gpu_memcpy_h2d_async(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
+}
+
+void gpu_memcpy_d2h_async(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream));
+}
+
+void gpu_stream_synchronize(cudaStream_t stream) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 }  // namespace gpu
