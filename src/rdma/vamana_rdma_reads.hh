@@ -93,27 +93,40 @@ inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& th
 
 /**
  * Read the neighbor list portion of a VamanaNode.
- * Reads: edge_count(1B) + R * RemotePtr(8B) from the neighbors offset.
+ * Reads only the fields actually needed by the search/insert path:
+ *   - edge_count (1B)
+ *   - neighbor slots (R * RemotePtr)
+ * The vector and RaBitQ payload that sit between them in remote layout are
+ * intentionally skipped.
  */
 inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread>& thread) {
-    // Read from edge_count offset through end of neighbors (includes 3B padding in between)
-    const size_t read_offset = VamanaNode::offset_edge_count();
-    const size_t read_end = VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE;
-    const size_t read_size = read_end - read_offset;
+    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
     thread->stats.rdma_reads_in_bytes += read_size;
-    thread->track_post();
 
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
+    thread->track_post();
     qp->post_send(reinterpret_cast<u64>(local_buffer),
-                  read_size,
+                  sizeof(u8),
                   thread->ctx->get_lkey(),
                   IBV_WR_RDMA_READ,
                   true,
                   false,
                   thread->ctx->get_remote_mrt(node_rptr.memory_node()),
-                  node_rptr.byte_offset() + read_offset,
+                  node_rptr.byte_offset() + VamanaNode::offset_edge_count(),
+                  0,
+                  thread->create_wr_id());
+
+    thread->track_post();
+    qp->post_send(reinterpret_cast<u64>(local_buffer + sizeof(u8)),
+                  VamanaNode::NEIGHBORS_SIZE,
+                  thread->ctx->get_lkey(),
+                  IBV_WR_RDMA_READ,
+                  true,
+                  false,
+                  thread->ctx->get_remote_mrt(node_rptr.memory_node()),
+                  node_rptr.byte_offset() + VamanaNode::offset_neighbors(),
                   0,
                   thread->create_wr_id());
 
@@ -125,13 +138,6 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
         static bool await_ready() { return false; }
         static void await_suspend(std::coroutine_handle<>) {}
         s_ptr<VamanaNeighborlist> await_resume() {
-            // local_buffer has: [edge_count(1B) | pad(3B) | neighbors(R*8B)]
-            // Compact: move neighbors from offset 4 to offset 1
-            // edge_count already at position 0
-            // Move neighbors from offset 4 (1B count + 3B pad) to offset 1
-            std::memmove(local_buffer + sizeof(u8),
-                        local_buffer + (VamanaNode::offset_neighbors() - VamanaNode::offset_edge_count()),
-                        VamanaNode::NEIGHBORS_SIZE);
             return std::make_shared<VamanaNeighborlist>(local_buffer, read_size, thread.get());
         }
     };
