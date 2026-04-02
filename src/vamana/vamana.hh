@@ -449,11 +449,20 @@ public:
                 }
                 all_candidate_ptrs.push_back(new_ptr);
 
-                // Read all vectors
-                vec<byte_t*> all_vec_bufs =
-                    co_await rdma::vamana::batch_read_vectors(all_candidate_ptrs, thread);
-
                 u32 n_all = all_candidate_ptrs.size();
+                vec<byte_t*> all_vec_bufs(n_all, nullptr);
+
+                // Read remote vectors for the existing neighbors only.
+                vec<RemotePtr> remote_candidate_ptrs;
+                remote_candidate_ptrs.reserve(n_all - 1);
+                for (u32 i = 0; i + 1 < n_all; ++i) {
+                    remote_candidate_ptrs.push_back(all_candidate_ptrs[i]);
+                }
+                vec<byte_t*> remote_vec_bufs =
+                    co_await rdma::vamana::batch_read_vectors(remote_candidate_ptrs, thread);
+                for (u32 i = 0; i + 1 < n_all; ++i) {
+                    all_vec_bufs[i] = remote_vec_bufs[i];
+                }
 
                 // Upload neighbor's vector as query for prune
                 std::memcpy(gs.h_query, neighbor_node->components().data(), dim_ * sizeof(float));
@@ -462,9 +471,15 @@ public:
 
                 // Compute distances from neighbor to all candidates
                 for (u32 i = 0; i < n_all; ++i) {
-                    std::memcpy(gs.h_candidate_vecs + i * dim_,
-                               reinterpret_cast<float*>(all_vec_bufs[i]),
-                               dim_ * sizeof(float));
+                    if (i + 1 == n_all) {
+                        std::memcpy(gs.h_candidate_vecs + i * dim_,
+                                   components.data(),
+                                   dim_ * sizeof(float));
+                    } else {
+                        std::memcpy(gs.h_candidate_vecs + i * dim_,
+                                   reinterpret_cast<float*>(all_vec_bufs[i]),
+                                   dim_ * sizeof(float));
+                    }
                 }
 
                 cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
@@ -507,7 +522,7 @@ public:
                                n_all * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, gs.stream);
 
-                for (u32 i = 0; i < n_all; ++i) {
+                for (u32 i = 0; i + 1 < n_all; ++i) {
                     thread->buffer_allocator.free_buffer(all_vec_bufs[i], dim_ * sizeof(element_t));
                 }
 
