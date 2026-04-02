@@ -464,26 +464,30 @@ void ComputeService<Distance>::start_workers() {
   const u32 num_threads = config_.num_threads;
   const u32 num_coroutines = config_.num_coroutines;
   const u32 dim = config_.dim;
-  const u32 num_insert_workers =
-      num_threads <= 1 ? 1 : std::clamp<u32>(num_threads / 2, 1, num_threads - 1);
-  const u32 num_query_workers = num_threads - num_insert_workers;
+  const u32 num_query_workers =
+      num_threads <= 1 ? 1 : std::clamp<u32>(std::min<u32>(4, std::max<u32>(1, num_threads / 4)), 1, num_threads - 1);
+  const u32 num_insert_workers = num_threads - num_query_workers;
+  const u32 query_coroutines = std::min<u32>(num_coroutines, 4);
+  const u32 insert_coroutines = num_coroutines;
 
   print_status("starting " + std::to_string(num_threads) + " service worker threads (Vamana)");
   print_status("worker split: inserts=" + std::to_string(num_insert_workers) +
-               ", queries=" + std::to_string(num_query_workers));
+               ", queries=" + std::to_string(num_query_workers) +
+               " | coroutines: insert=" + std::to_string(insert_coroutines) +
+               ", query=" + std::to_string(query_coroutines));
   workers_.reserve(num_threads);
 
   for (u32 tid = 0; tid < num_insert_workers; ++tid) {
-    workers_.emplace_back([this, num_coroutines, dim, tid]() {
+    workers_.emplace_back([this, insert_coroutines, dim, tid]() {
       service::vamana_service_schedule_inserts<Distance>(
-        *vamana_, insert_queue_, shutdown_, num_coroutines, compute_threads()[tid], dim, workers_paused_, workers_idle_count_);
+        *vamana_, insert_queue_, shutdown_, insert_coroutines, compute_threads()[tid], dim, workers_paused_, workers_idle_count_);
     });
   }
 
   for (u32 tid = num_insert_workers; tid < num_threads; ++tid) {
-    workers_.emplace_back([this, num_coroutines, dim, tid]() {
+    workers_.emplace_back([this, query_coroutines, dim, tid]() {
       service::vamana_service_schedule_queries<Distance>(
-        *vamana_, query_queue_, shutdown_, num_coroutines, compute_threads()[tid], dim, workers_paused_, workers_idle_count_);
+        *vamana_, query_queue_, shutdown_, query_coroutines, compute_threads()[tid], dim, workers_paused_, workers_idle_count_);
     });
   }
 
