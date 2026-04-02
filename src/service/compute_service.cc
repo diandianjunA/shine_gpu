@@ -464,9 +464,9 @@ void ComputeService<Distance>::start_workers() {
   const u32 num_threads = config_.num_threads;
   const u32 num_coroutines = config_.num_coroutines;
   const u32 dim = config_.dim;
-  const u32 num_query_workers =
-      num_threads <= 1 ? 1 : std::clamp<u32>(std::min<u32>(4, std::max<u32>(1, num_threads / 4)), 1, num_threads - 1);
-  const u32 num_insert_workers = num_threads - num_query_workers;
+  const u32 num_insert_workers =
+      num_threads <= 1 ? 1 : std::clamp<u32>(num_threads / 2, 1, num_threads - 1);
+  const u32 num_query_workers = num_threads - num_insert_workers;
   const u32 query_coroutines = std::min<u32>(num_coroutines, 4);
   const u32 insert_coroutines = num_coroutines;
 
