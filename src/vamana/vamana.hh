@@ -73,11 +73,20 @@ public:
             }
         }
 
-        // Upload query vector to GPU
+        // Upload query vector and prepare RaBitQ query factors once.
         auto& gs = gpu.state(coro_id);
         std::memcpy(gs.h_query, components.data(), dim_ * sizeof(float));
         cudaMemcpyAsync(gs.d_query, gs.h_query, dim_ * sizeof(float),
                         cudaMemcpyHostToDevice, gs.stream);
+        gpu::launch_rabitq_query_prepare(
+            gs.stream, gs.event,
+            gs.d_query,
+            gpu.d_rotation_matrix(),
+            gpu.d_centroid(),
+            gs.d_rot_query,
+            gs.d_query_factor,
+            dim_, rabitq_bits_);
+        co_await gpu::GpuAwaitable{thread.get()};
 
         // Initialize beam with medoid (exact L2 distance)
         distance_t medoid_dist = Distance::dist(components, medoid_node->components(), VamanaNode::DIM);
@@ -88,7 +97,7 @@ public:
         visited.clear();
         visited.insert(medoid_ptr);
 
-        // Beam search loop using exact L2 distances (GPU-accelerated)
+        // Beam search loop using RaBitQ approximate distances on GPU.
         while (true) {
             // Find closest unexpanded candidate
             i32 best_idx = -1;
@@ -120,26 +129,26 @@ public:
 
             if (unvisited.empty()) continue;
 
-            // Batch RDMA read full vectors for exact distance computation
-            vec<byte_t*> vec_bufs = co_await rdma::vamana::batch_read_vectors(unvisited, thread);
-
-            // Stage to GPU and compute exact L2 distances
+            // Batch RDMA read RaBitQ payloads and score them on GPU.
+            vec<byte_t*> rabitq_bufs = co_await rdma::vamana::batch_read_rabitq(unvisited, thread);
             const u32 n_batch = unvisited.size();
             for (u32 i = 0; i < n_batch; ++i) {
-                std::memcpy(gs.h_candidate_vecs + i * dim_,
-                           reinterpret_cast<float*>(vec_bufs[i]),
-                           dim_ * sizeof(float));
-                thread->buffer_allocator.free_buffer(vec_bufs[i], dim_ * sizeof(element_t));
+                std::memcpy(gs.h_rabitq_vecs + i * VamanaNode::RABITQ_SIZE,
+                           rabitq_bufs[i],
+                           VamanaNode::RABITQ_SIZE);
+                thread->buffer_allocator.free_buffer(rabitq_bufs[i], VamanaNode::RABITQ_SIZE);
             }
 
-            cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
-                           n_batch * dim_ * sizeof(float),
+            cudaMemcpyAsync(gs.d_rabitq_vecs, gs.h_rabitq_vecs,
+                           n_batch * VamanaNode::RABITQ_SIZE,
                            cudaMemcpyHostToDevice, gs.stream);
 
-            gpu::launch_batch_l2_distances(
+            gpu::launch_batch_rabitq_distances(
                 gs.stream, gs.event,
-                gs.d_query, gs.d_candidate_vecs,
-                gs.d_distances, n_batch, dim_);
+                gs.d_rot_query,
+                gs.d_query_factor,
+                gs.d_rabitq_vecs,
+                gs.d_distances, n_batch, dim_, rabitq_bits_);
             co_await gpu::GpuAwaitable{thread.get()};
 
             // Copy distances back
@@ -602,11 +611,23 @@ private:
     MinorCoroutine cache_lookup(RemotePtr rptr,
                                 s_ptr<VamanaNode>& value,
                                 const u_ptr<ComputeThread>& thread,
-                                [[maybe_unused]] bool admit) const {
-        // TODO: integrate VamanaNode into the cache system.
-        // The current Cache stores s_ptr<Node>; VamanaNode requires a separate
-        // cache entry type or a type-erased value. For the baseline, always RDMA read.
-        value = co_await rdma::vamana::read_vamana_node(rptr, thread);
+                                bool admit) const {
+        if (!use_cache_) {
+            value = co_await rdma::vamana::read_vamana_node(rptr, thread);
+            co_return;
+        }
+
+        auto cache_entry = thread->cache.get<VamanaNode>(rptr);
+        if (cache_entry.has_value()) {
+            value = *cache_entry;
+            ++thread->stats.cache_hits;
+        } else {
+            value = co_await rdma::vamana::read_vamana_node(rptr, thread);
+            if (admit) {
+                thread->cache.insert(rptr, value, thread->get_id());
+            }
+            ++thread->stats.cache_misses;
+        }
     }
 
 private:
