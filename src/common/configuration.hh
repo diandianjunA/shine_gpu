@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <iostream>
 #include <library/configuration.hh>
@@ -36,6 +38,11 @@ public:
   u32 rabitq_bits{};      // bits per dimension for RaBitQ quantization
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
+  str search_mode{"exact_gpu"};
+  u32 insert_workers{};
+  u32 query_workers{};
+  u32 insert_coroutines{};
+  u32 query_coroutines{};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -62,6 +69,7 @@ public:
   IndexConfiguration(int argc, char** argv) {
     add_options();
     process_program_options(argc, argv);
+    search_mode = normalize_search_mode(search_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -115,6 +123,16 @@ private:
       "alpha", po::value<f64>(&alpha)->default_value(1.2), "RobustPrune diversity factor.")(
       "rabitq-bits", po::value<u32>(&rabitq_bits)->default_value(1),
       "Bits per dimension for RaBitQ quantization (1, 2, 4, or 8).")(
+      "search-mode", po::value<str>(&search_mode)->default_value(search_mode),
+      "Search mode for the query path: exact_gpu or rabitq_gpu.")(
+      "insert-workers", po::value<u32>(&insert_workers)->default_value(0),
+      "Dedicated insert worker threads. 0 keeps the built-in split.")(
+      "query-workers", po::value<u32>(&query_workers)->default_value(0),
+      "Dedicated query worker threads. 0 keeps the built-in split.")(
+      "insert-coroutines", po::value<u32>(&insert_coroutines)->default_value(0),
+      "Coroutines per insert worker. 0 uses the global coroutines value.")(
+      "query-coroutines", po::value<u32>(&query_coroutines)->default_value(0),
+      "Coroutines per query worker. 0 uses the built-in query default.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
@@ -144,12 +162,45 @@ private:
       exit_with_help_message(argv);
     }
 
+    if (search_mode != "exact_gpu" && search_mode != "rabitq_gpu") {
+      std::cerr << "[ERROR]: --search-mode must be exact_gpu or rabitq_gpu" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (rabitq_bits != 1 && rabitq_bits != 2 && rabitq_bits != 4 && rabitq_bits != 8) {
+      std::cerr << "[ERROR]: --rabitq-bits must be 1, 2, 4, or 8" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (insert_workers > num_threads || query_workers > num_threads) {
+      std::cerr << "[ERROR]: --insert-workers and --query-workers cannot exceed --threads" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (insert_workers > 0 && query_workers > 0 && insert_workers + query_workers != num_threads) {
+      std::cerr << "[ERROR]: --insert-workers + --query-workers must equal --threads when both are set" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (insert_coroutines > num_coroutines || query_coroutines > num_coroutines) {
+      std::cerr << "[ERROR]: --insert-coroutines and --query-coroutines cannot exceed --coroutines" << std::endl;
+      exit_with_help_message(argv);
+    }
+  }
+
+  static str normalize_search_mode(str value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    return value;
   }
 
 public:
   filepath_t resolved_index_prefix() const {
     return index_path::resolve_prefix(data_path, index_prefix, R, beam_width_construction);
   }
+
+  bool use_rabitq_search() const { return search_mode == "rabitq_gpu"; }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -179,6 +230,11 @@ public:
       os << std::setw(width) << "beam width (construction): " << config.beam_width_construction << std::endl;
       os << std::setw(width) << "alpha: " << config.alpha << std::endl;
       os << std::setw(width) << "RaBitQ bits: " << config.rabitq_bits << std::endl;
+      os << std::setw(width) << "search mode: " << config.search_mode << std::endl;
+      os << std::setw(width) << "insert workers: " << config.insert_workers << std::endl;
+      os << std::setw(width) << "query workers: " << config.query_workers << std::endl;
+      os << std::setw(width) << "insert coroutines: " << config.insert_coroutines << std::endl;
+      os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {

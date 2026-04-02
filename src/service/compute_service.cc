@@ -17,6 +17,7 @@ constexpr u32 kRpcMagic = 0x53484e57;  // "SHNW"
 constexpr u32 kRpcVersion = 1;
 constexpr u32 kInitialRpcRecvsPerPeer = 8;
 constexpr u32 kMaxRpcResults = 512;
+constexpr u32 kRabitqSearchBeamSlack = 64;
 
 MinorCoroutine read_medoid_probe(RemotePtr& medoid_ptr, s_ptr<VamanaNode>& node, const u_ptr<ComputeThread>& thread) {
   medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
@@ -55,11 +56,14 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   // Initialize GPU
   gpu::gpu_init(static_cast<int>(config_.gpu_device));
+  service_profile_ = resolve_service_profile();
+  print_status("search mode: " + config_.search_mode +
+               ", cache=" + (config_.use_cache ? str{"on"} : str{"off"}));
 
   // Construct Vamana index
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
     config_.R, config_.beam_width, config_.beam_width_construction,
-    config_.alpha, config_.k, config_.rabitq_bits, config_.dim, config_.use_cache);
+    config_.alpha, config_.k, config_.rabitq_bits, config_.dim, config_.use_cache, config_.use_rabitq_search());
 
   const size_t estimated_index_size = config_.max_vectors * VamanaNode::total_size();
   const size_t cache_size = static_cast<f32>(estimated_index_size) / 100. * config_.cache_size_ratio;
@@ -82,7 +86,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines);
 
   // Initialize GPU buffers for each compute thread
-  const u32 max_batch = std::max(config_.beam_width, config_.beam_width_construction);
+  const u32 search_batch =
+      config_.use_rabitq_search() ? (config_.beam_width + kRabitqSearchBeamSlack) : config_.beam_width;
+  const u32 max_batch = std::max(search_batch, config_.beam_width_construction);
   for (auto& thread : compute_threads()) {
     thread->gpu_buffers.init(config_.num_coroutines, config_.dim, max_batch, config_.R, config_.rabitq_bits);
   }
@@ -90,6 +96,10 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   wait_for_load_or_store();
   synchronize_clients_after_startup();
+  if (config_.load_index && config_.use_rabitq_search() && !rabitq_artifacts_ready_) {
+    str artifact_error;
+    lib_assert(maybe_load_rabitq_artifacts(config_.resolved_index_prefix(), &artifact_error), artifact_error);
+  }
 
   {
     std::lock_guard<std::mutex> lock(routing_mutex_);
@@ -242,6 +252,12 @@ bool ComputeService<Distance>::load_index(const std::string& path, str* error_me
     }
   }
 
+  if (!maybe_load_rabitq_artifacts(filepath_t{path}, error_message)) {
+    resume_rpc();
+    resume_workers();
+    return false;
+  }
+
   if (routing_enabled()) {
     std::lock_guard<std::mutex> lock(routing_mutex_);
     routing_centroids_[cm_.client_id] = compute_local_routing_centroid();
@@ -389,6 +405,115 @@ void ComputeService<Distance>::wait_for_load_or_store() {
     const str detail = msg.empty() ? "" : ": " + msg;
     lib_assert(resp.success, "startup load/store failed on memory server " + std::to_string(i) + detail);
   }
+
+  if (cmd == mn_command::LOAD && config_.use_rabitq_search()) {
+    str artifact_error;
+    lib_assert(maybe_load_rabitq_artifacts(index_prefix, &artifact_error), artifact_error);
+  }
+}
+
+template <class Distance>
+typename ComputeService<Distance>::ServiceProfile ComputeService<Distance>::resolve_service_profile() const {
+  ServiceProfile profile{};
+  const u32 num_threads = config_.num_threads;
+
+  if (config_.insert_workers == 0 && config_.query_workers == 0) {
+    profile.insert_workers = num_threads <= 1 ? 1 : std::clamp<u32>(num_threads / 2, 1, num_threads - 1);
+    profile.query_workers = num_threads - profile.insert_workers;
+  } else if (config_.insert_workers == 0) {
+    profile.query_workers = config_.query_workers;
+    profile.insert_workers = num_threads - profile.query_workers;
+  } else if (config_.query_workers == 0) {
+    profile.insert_workers = config_.insert_workers;
+    profile.query_workers = num_threads - profile.insert_workers;
+  } else {
+    profile.insert_workers = config_.insert_workers;
+    profile.query_workers = config_.query_workers;
+  }
+
+  lib_assert(profile.insert_workers <= num_threads, "insert worker split exceeds total threads");
+  lib_assert(profile.query_workers <= num_threads, "query worker split exceeds total threads");
+  lib_assert(profile.insert_workers + profile.query_workers == num_threads, "invalid worker split");
+  lib_assert(profile.insert_workers > 0, "service profile requires at least one insert worker");
+  lib_assert(profile.query_workers > 0, "service profile requires at least one query worker");
+
+  profile.insert_coroutines = config_.insert_coroutines == 0 ? config_.num_coroutines : config_.insert_coroutines;
+  profile.query_coroutines =
+    config_.query_coroutines == 0 ? std::min<u32>(config_.num_coroutines, 4) : config_.query_coroutines;
+
+  lib_assert(profile.insert_coroutines > 0 && profile.insert_coroutines <= config_.num_coroutines,
+             "invalid insert coroutine count");
+  lib_assert(profile.query_coroutines > 0 && profile.query_coroutines <= config_.num_coroutines,
+             "invalid query coroutine count");
+  return profile;
+}
+
+template <class Distance>
+bool ComputeService<Distance>::maybe_load_rabitq_artifacts(const filepath_t& index_prefix, str* error_message) {
+  if (!config_.use_rabitq_search()) {
+    return true;
+  }
+
+  rabitq_artifacts_ready_ = false;
+
+  if (index_prefix.empty()) {
+    if (error_message) {
+      *error_message = "rabitq_gpu search requires a non-empty index prefix";
+    }
+    return false;
+  }
+
+  service::rabitq::Artifacts artifacts;
+  if (!service::rabitq::load_artifacts(index_prefix, artifacts, error_message)) {
+    return false;
+  }
+
+  if (artifacts.dim != config_.dim) {
+    if (error_message) {
+      *error_message = "RaBitQ artifact dim mismatch: expected " + std::to_string(config_.dim) +
+                       ", got " + std::to_string(artifacts.dim);
+    }
+    return false;
+  }
+  if (artifacts.rabitq_bits != config_.rabitq_bits) {
+    if (error_message) {
+      *error_message = "RaBitQ artifact bits mismatch: expected " + std::to_string(config_.rabitq_bits) +
+                       ", got " + std::to_string(artifacts.rabitq_bits);
+    }
+    return false;
+  }
+  if (artifacts.rabitq_size != VamanaNode::RABITQ_SIZE) {
+    if (error_message) {
+      *error_message = "RaBitQ artifact size mismatch: expected " + std::to_string(VamanaNode::RABITQ_SIZE) +
+                       ", got " + std::to_string(artifacts.rabitq_size);
+    }
+    return false;
+  }
+  if (artifacts.num_memory_nodes != num_servers_) {
+    if (error_message) {
+      *error_message = "RaBitQ artifact memory-node count mismatch: expected " + std::to_string(num_servers_) +
+                       ", got " + std::to_string(artifacts.num_memory_nodes);
+    }
+    return false;
+  }
+
+  upload_rabitq_artifacts(artifacts);
+  rabitq_artifacts_ready_ = true;
+  print_status("loaded RaBitQ artifacts from " + index_prefix.string() +
+               " (dim=" + std::to_string(artifacts.dim) +
+               ", bits=" + std::to_string(artifacts.rabitq_bits) + ")");
+  return true;
+}
+
+template <class Distance>
+void ComputeService<Distance>::upload_rabitq_artifacts(const service::rabitq::Artifacts& artifacts) {
+  for (auto& thread : compute_threads()) {
+    thread->gpu_buffers.configure_rabitq(
+      artifacts.rotation_matrix.data(),
+      artifacts.rotated_centroid.data(),
+      artifacts.dim,
+      artifacts.t_const);
+  }
 }
 
 template <class Distance>
@@ -462,13 +587,11 @@ auto ComputeService<Distance>::send_index_command(mn_command::Command cmd, const
 template <class Distance>
 void ComputeService<Distance>::start_workers() {
   const u32 num_threads = config_.num_threads;
-  const u32 num_coroutines = config_.num_coroutines;
   const u32 dim = config_.dim;
-  const u32 num_insert_workers =
-      num_threads <= 1 ? 1 : std::clamp<u32>(num_threads / 2, 1, num_threads - 1);
-  const u32 num_query_workers = num_threads - num_insert_workers;
-  const u32 query_coroutines = std::min<u32>(num_coroutines, 4);
-  const u32 insert_coroutines = num_coroutines;
+  const u32 num_insert_workers = service_profile_.insert_workers;
+  const u32 num_query_workers = service_profile_.query_workers;
+  const u32 insert_coroutines = service_profile_.insert_coroutines;
+  const u32 query_coroutines = service_profile_.query_coroutines;
 
   print_status("starting " + std::to_string(num_threads) + " service worker threads (Vamana)");
   print_status("worker split: inserts=" + std::to_string(num_insert_workers) +

@@ -14,6 +14,8 @@ struct CUstream_st;
 struct CUevent_st;
 typedef CUstream_st* cudaStream_t;
 typedef CUevent_st* cudaEvent_t;
+struct cublasContext;
+typedef cublasContext* cublasHandle_t;
 
 namespace gpu {
 
@@ -96,6 +98,7 @@ void launch_robust_prune(cudaStream_t stream, cudaEvent_t event,
  * @param t_const        Pre-computed scaling constant
  */
 void launch_rabitq_quantize_single(cudaStream_t stream, cudaEvent_t event,
+                                   cublasHandle_t cublas_handle,
                                    const float* d_vector,
                                    const float* d_rotation_mat,
                                    const float* d_centroid,
@@ -117,6 +120,7 @@ void launch_rabitq_quantize_single(cudaStream_t stream, cudaEvent_t event,
  * @param bits_per_dim   Quantization bits per dimension
  */
 void launch_rabitq_query_prepare(cudaStream_t stream, cudaEvent_t event,
+                                 cublasHandle_t cublas_handle,
                                  const float* d_query,
                                  const float* d_rotation_mat,
                                  const float* d_centroid,

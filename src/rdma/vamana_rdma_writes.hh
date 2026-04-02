@@ -13,13 +13,22 @@
 
 namespace rdma::vamana {
 
+inline void track_total_rdma_write(const u_ptr<ComputeThread>& thread, size_t bytes) {
+    thread->stats.rdma_writes_in_bytes += bytes;
+    if (thread->is_query_worker()) {
+        thread->stats.query_rdma_writes_in_bytes += bytes;
+    } else if (thread->is_insert_worker()) {
+        thread->stats.build_rdma_writes_in_bytes += bytes;
+    }
+}
+
 /**
  * Unlock a VamanaNode by writing 0 to the lock byte.
  */
 inline auto unlock_vamana_node(const s_ptr<VamanaNode>& node, const u_ptr<ComputeThread>& thread) {
     byte_t unlock = 0;
 
-    thread->stats.rdma_writes_in_bytes += 1;
+    track_total_rdma_write(thread, 1);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[node->rptr.memory_node()]->qp;
@@ -90,7 +99,7 @@ inline auto write_vamana_node(const RemotePtr& rptr,
         reinterpret_cast<u64*>(ptr)[i] = 0;
     }
 
-    thread->stats.rdma_writes_in_bytes += total;
+    track_total_rdma_write(thread, total);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
@@ -149,7 +158,7 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
         reinterpret_cast<u64*>(nbr_buffer)[i] = 0;
     }
 
-    thread->stats.rdma_writes_in_bytes += meta_size + VamanaNode::NEIGHBORS_SIZE;
+    track_total_rdma_write(thread, meta_size + VamanaNode::NEIGHBORS_SIZE);
 
     const QP& qp = thread->ctx->qps[node->rptr.memory_node()]->qp;
 
@@ -201,7 +210,7 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
  * Write the medoid pointer to memory node 0 (at offset 8).
  */
 inline auto write_medoid_ptr(const RemotePtr& medoid_ptr, const u_ptr<ComputeThread>& thread) {
-    thread->stats.rdma_writes_in_bytes += RemotePtr::SIZE;
+    track_total_rdma_write(thread, RemotePtr::SIZE);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[0]->qp;
@@ -229,7 +238,7 @@ inline auto write_vamana_header(const RemotePtr& rptr,
     if (medoid_lock) header |= VamanaNode::HEADER_MEDOID_LOCK;
     if (node_lock) header |= VamanaNode::HEADER_NODE_LOCK;
 
-    thread->stats.rdma_writes_in_bytes += VamanaNode::HEADER_SIZE;
+    track_total_rdma_write(thread, VamanaNode::HEADER_SIZE);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;

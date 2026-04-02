@@ -26,6 +26,8 @@ struct CUstream_st;
 struct CUevent_st;
 typedef CUstream_st* cudaStream_t;
 typedef CUevent_st* cudaEvent_t;
+struct cublasContext;
+typedef cublasContext* cublasHandle_t;
 
 namespace gpu {
 
@@ -98,6 +100,7 @@ public:
     float* d_rotation_matrix() const { return d_rotation_mat_; }
     float* d_centroid() const { return d_centroid_; }
     double t_const() const { return t_const_; }
+    cublasHandle_t cublas_handle() const { return cublas_handle_; }
 
     /**
      * Upload rotation matrix to device. Called once during index load.
@@ -114,6 +117,14 @@ public:
     void upload_centroid(const float* host_centroid, uint32_t dim);
 
     /**
+     * Upload the complete RaBitQ parameter set and mark it ready for search.
+     */
+    void configure_rabitq(const float* host_matrix,
+                          const float* host_centroid,
+                          uint32_t dim,
+                          double t_const);
+
+    /**
      * Set t_const scaling factor (computed on host during index setup).
      */
     void set_t_const(double val) { t_const_ = val; }
@@ -123,6 +134,7 @@ public:
     uint32_t max_R() const { return max_R_; }
     uint32_t rabitq_vec_size() const { return rabitq_vec_size_; }
     bool initialized() const { return initialized_; }
+    bool rabitq_ready() const { return rabitq_ready_; }
 
 private:
     CoroutineGpuState* states_{nullptr};
@@ -137,6 +149,8 @@ private:
     float* d_rotation_mat_{nullptr};  // [dim * dim]
     float* d_centroid_{nullptr};      // [dim]
     double t_const_{0.0};
+    cublasHandle_t cublas_handle_{nullptr};
+    bool rabitq_ready_{false};
 
     bool initialized_{false};
 };

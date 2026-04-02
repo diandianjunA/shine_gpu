@@ -14,6 +14,42 @@
 
 namespace rdma::vamana {
 
+inline void track_total_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
+    thread->stats.rdma_reads_in_bytes += bytes;
+    if (thread->is_query_worker()) {
+        thread->stats.query_rdma_reads_in_bytes += bytes;
+    } else if (thread->is_insert_worker()) {
+        thread->stats.build_rdma_reads_in_bytes += bytes;
+    }
+}
+
+inline void track_neighbor_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
+    track_total_rdma_read(thread, bytes);
+    if (thread->is_query_worker()) {
+        thread->stats.query_neighbor_rdma_reads_in_bytes += bytes;
+    } else if (thread->is_insert_worker()) {
+        thread->stats.build_neighbor_rdma_reads_in_bytes += bytes;
+    }
+}
+
+inline void track_vector_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
+    track_total_rdma_read(thread, bytes);
+    if (thread->is_query_worker()) {
+        thread->stats.query_vector_rdma_reads_in_bytes += bytes;
+    } else if (thread->is_insert_worker()) {
+        thread->stats.build_vector_rdma_reads_in_bytes += bytes;
+    }
+}
+
+inline void track_rabitq_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
+    track_total_rdma_read(thread, bytes);
+    if (thread->is_query_worker()) {
+        thread->stats.query_rabitq_rdma_reads_in_bytes += bytes;
+    } else if (thread->is_insert_worker()) {
+        thread->stats.build_rabitq_rdma_reads_in_bytes += bytes;
+    }
+}
+
 /**
  * Read a complete VamanaNode from remote memory.
  * Reads header + id + edge_count + pad + vector (not rabitq or neighbors).
@@ -22,7 +58,7 @@ inline auto read_vamana_node(RemotePtr rptr, const u_ptr<ComputeThread>& thread)
     const size_t read_size = VamanaNode::size_until_vector_end();
     byte_t* node_ptr = thread->buffer_allocator.allocate_buffer(read_size);
 
-    thread->stats.rdma_reads_in_bytes += read_size;
+    track_vector_rdma_read(thread, read_size);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
@@ -60,7 +96,7 @@ inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& th
     const size_t read_size = VamanaNode::total_size();
     byte_t* node_ptr = thread->buffer_allocator.allocate_vamana_node(thread->get_id());
 
-    thread->stats.rdma_reads_in_bytes += read_size;
+    track_vector_rdma_read(thread, read_size);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
@@ -103,7 +139,7 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
     const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
-    thread->stats.rdma_reads_in_bytes += read_size;
+    track_neighbor_rdma_read(thread, read_size);
 
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
     thread->track_post();
@@ -153,7 +189,7 @@ inline auto read_rabitq_vector(RemotePtr node_rptr, const u_ptr<ComputeThread>& 
     const size_t rabitq_size = VamanaNode::RABITQ_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(rabitq_size);
 
-    thread->stats.rdma_reads_in_bytes += rabitq_size;
+    track_rabitq_rdma_read(thread, rabitq_size);
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
@@ -197,7 +233,7 @@ inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs, const u_ptr<Comp
         byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(rabitq_size);
         buffers.push_back(local_buffer);
 
-        thread->stats.rdma_reads_in_bytes += rabitq_size;
+        track_rabitq_rdma_read(thread, rabitq_size);
         thread->track_post();
 
         const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
@@ -237,7 +273,7 @@ inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs, const u_ptr<Com
         byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(vec_size);
         buffers.push_back(local_buffer);
 
-        thread->stats.rdma_reads_in_bytes += vec_size;
+        track_vector_rdma_read(thread, vec_size);
         thread->track_post();
 
         const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
@@ -277,7 +313,7 @@ inline auto read_vamana_nodes(const span<RemotePtr> remote_ptrs, const u_ptr<Com
         byte_t* node_ptr = thread->buffer_allocator.allocate_buffer(read_size);
         nodes.emplace_back(std::make_shared<VamanaNode>(node_ptr, read_size, rptr, thread.get()));
 
-        thread->stats.rdma_reads_in_bytes += read_size;
+        track_vector_rdma_read(thread, read_size);
         thread->track_post();
 
         const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
@@ -308,7 +344,7 @@ inline auto read_vamana_nodes(const span<RemotePtr> remote_ptrs, const u_ptr<Com
  * Read the medoid pointer from memory node 0 (stored at offset 8, same as entry_point).
  */
 inline auto read_medoid_ptr(const u_ptr<ComputeThread>& thread) {
-    thread->stats.rdma_reads_in_bytes += sizeof(u64);
+    track_total_rdma_read(thread, sizeof(u64));
     thread->track_post();
 
     const QP& qp = thread->ctx->qps[0]->qp;

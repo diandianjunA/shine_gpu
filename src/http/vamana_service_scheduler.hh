@@ -8,6 +8,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <thread>
 
@@ -44,6 +45,7 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
                                      std::atomic<bool>& paused,
                                      std::atomic<u32>& idle_count) {
   thread->reset();
+  thread->set_service_role(ServiceWorkerRole::insert);
   io::Database<element_t> staging;
   staging.allocate(dim, num_coroutines);
 
@@ -75,6 +77,9 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
         InsertRequest* req = nullptr;
         if (queue.try_dequeue(req)) {
           all_idle = false;
+          const auto queue_wait = std::chrono::steady_clock::now() - req->enqueued_at;
+          thread->stats.insert_queue_wait_ns +=
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
 
           auto slot_components = staging.get_components(cid);
           std::copy(req->components.begin(), req->components.end(), slot_components.begin());
@@ -132,6 +137,7 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
                                      std::atomic<bool>& paused,
                                      std::atomic<u32>& idle_count) {
   thread->reset();
+  thread->set_service_role(ServiceWorkerRole::query);
   io::Database<element_t> staging;
   staging.allocate(dim, num_coroutines);
 
@@ -174,6 +180,9 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
         QueryRequest* req = nullptr;
         if (queue.try_dequeue(req)) {
           all_idle = false;
+          const auto queue_wait = std::chrono::steady_clock::now() - req->enqueued_at;
+          thread->stats.query_queue_wait_ns +=
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
 
           auto slot_components = staging.get_components(cid);
           std::copy(req->components.begin(), req->components.end(), slot_components.begin());

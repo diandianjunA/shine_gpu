@@ -1,5 +1,6 @@
 #include "gpu_buffer_manager.hh"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,16 @@
         if (err != cudaSuccess) {                                              \
             fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
                     cudaGetErrorString(err));                                   \
+            abort();                                                           \
+        }                                                                      \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                                    \
+    do {                                                                       \
+        cublasStatus_t status = (call);                                        \
+        if (status != CUBLAS_STATUS_SUCCESS) {                                 \
+            fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__,          \
+                    __LINE__, static_cast<int>(status));                        \
             abort();                                                           \
         }                                                                      \
     } while (0)
@@ -31,8 +42,10 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
     max_R_ = max_R;
     rabitq_bits_ = rabitq_bits;
     rabitq_vec_size_ = (rabitq_bits * dim + 7) / 8 + 2 * sizeof(float);
+    rabitq_ready_ = false;
 
     states_ = new CoroutineGpuState[num_coroutines];
+    CUBLAS_CHECK(cublasCreate(&cublas_handle_));
 
     for (uint32_t i = 0; i < num_coroutines; ++i) {
         auto& s = states_[i];
@@ -122,9 +135,12 @@ void GpuBufferManager::destroy() {
     // Shared resources
     if (d_rotation_mat_) cudaFree(d_rotation_mat_);
     if (d_centroid_) cudaFree(d_centroid_);
+    if (cublas_handle_) cublasDestroy(cublas_handle_);
 
     delete[] states_;
     states_ = nullptr;
+    cublas_handle_ = nullptr;
+    rabitq_ready_ = false;
     initialized_ = false;
 }
 
@@ -142,6 +158,16 @@ void GpuBufferManager::upload_centroid(const float* host_centroid, uint32_t dim)
         CUDA_CHECK(cudaMalloc(&d_centroid_, bytes));
     }
     CUDA_CHECK(cudaMemcpy(d_centroid_, host_centroid, bytes, cudaMemcpyHostToDevice));
+}
+
+void GpuBufferManager::configure_rabitq(const float* host_matrix,
+                                        const float* host_centroid,
+                                        uint32_t dim,
+                                        double t_const) {
+    upload_rotation_matrix(host_matrix, dim);
+    upload_centroid(host_centroid, dim);
+    set_t_const(t_const);
+    rabitq_ready_ = true;
 }
 
 }  // namespace gpu

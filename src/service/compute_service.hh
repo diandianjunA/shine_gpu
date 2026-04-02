@@ -15,6 +15,7 @@
 #include "common/core_assignment.hh"
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node.hh"
+#include "service/rabitq_artifacts.hh"
 #include "vamana/vamana.hh"
 #include "worker_pool.hh"
 
@@ -70,6 +71,13 @@ public:
     u32 threads{};
   };
 
+  struct ServiceProfile {
+    u32 insert_workers{};
+    u32 query_workers{};
+    u32 insert_coroutines{};
+    u32 query_coroutines{};
+  };
+
 public:
   explicit ComputeService(const Configuration& config, bool shutdown_remote_on_stop = false);
   ~ComputeService();
@@ -89,6 +97,9 @@ private:
   void init_remote_tokens();
   void receive_remote_access_tokens();
   void wait_for_load_or_store();
+  ServiceProfile resolve_service_profile() const;
+  bool maybe_load_rabitq_artifacts(const filepath_t& index_prefix, str* error_message = nullptr);
+  void upload_rabitq_artifacts(const service::rabitq::Artifacts& artifacts);
   void synchronize_clients_after_startup();
   vec<CommandResult> send_index_command(mn_command::Command cmd, const std::string& path);
   void start_workers();
@@ -145,6 +156,8 @@ private:
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<WorkerPool> worker_pool_;
+  ServiceProfile service_profile_{};
+  bool rabitq_artifacts_ready_{false};
   service::InsertQueue insert_queue_;
   service::QueryQueue query_queue_;
   vec<std::thread> workers_;

@@ -13,8 +13,6 @@ namespace gpu {
 static constexpr uint32_t TILE_SIZE = 4;
 static constexpr uint32_t BLOCK_SIZE = 512;
 
-static cublasHandle_t g_cublas_handle = nullptr;
-
 #define CUDA_CHECK(call)                                                      \
     do {                                                                       \
         cudaError_t err = (call);                                              \
@@ -41,14 +39,9 @@ static cublasHandle_t g_cublas_handle = nullptr;
 
 void gpu_init(int device_id) {
     CUDA_CHECK(cudaSetDevice(device_id));
-    CUBLAS_CHECK(cublasCreate(&g_cublas_handle));
 }
 
 void gpu_shutdown() {
-    if (g_cublas_handle) {
-        cublasDestroy(g_cublas_handle);
-        g_cublas_handle = nullptr;
-    }
 }
 
 // =============================================================================
@@ -159,6 +152,7 @@ void launch_robust_prune(cudaStream_t stream, cudaEvent_t event,
 // =============================================================================
 
 void launch_rabitq_quantize_single(cudaStream_t stream, cudaEvent_t event,
+                                   cublasHandle_t cublas_handle,
                                    const float* d_vector,
                                    const float* d_rotation_mat,
                                    const float* d_centroid,
@@ -170,9 +164,9 @@ void launch_rabitq_quantize_single(cudaStream_t stream, cudaEvent_t event,
     float* d_rot_vec = nullptr;
     CUDA_CHECK(cudaMallocAsync(&d_rot_vec, dim * sizeof(float), stream));
 
-    cublasSetStream(g_cublas_handle, stream);
+    cublasSetStream(cublas_handle, stream);
     float alpha_blas = 1.0f, beta_blas = 0.0f;
-    CUBLAS_CHECK(cublasSgemv(g_cublas_handle, CUBLAS_OP_T,
+    CUBLAS_CHECK(cublasSgemv(cublas_handle, CUBLAS_OP_T,
                              dim, dim,
                              &alpha_blas,
                              d_rotation_mat, dim,
@@ -223,6 +217,7 @@ void launch_rabitq_quantize_single(cudaStream_t stream, cudaEvent_t event,
 // =============================================================================
 
 void launch_rabitq_query_prepare(cudaStream_t stream, cudaEvent_t event,
+                                 cublasHandle_t cublas_handle,
                                  const float* d_query,
                                  const float* d_rotation_mat,
                                  const float* d_centroid,
@@ -230,9 +225,9 @@ void launch_rabitq_query_prepare(cudaStream_t stream, cudaEvent_t event,
                                  void* d_query_factor,
                                  uint32_t dim, uint32_t bits_per_dim) {
     // Step 1: Rotate query using cuBLAS (P^T * q)
-    cublasSetStream(g_cublas_handle, stream);
+    cublasSetStream(cublas_handle, stream);
     float alpha_blas = 1.0f, beta_blas = 0.0f;
-    CUBLAS_CHECK(cublasSgemv(g_cublas_handle, CUBLAS_OP_T,
+    CUBLAS_CHECK(cublasSgemv(cublas_handle, CUBLAS_OP_T,
                              dim, dim,
                              &alpha_blas,
                              d_rotation_mat, dim,

@@ -1,7 +1,7 @@
-# SHINE: A Scalable HNSW Index in Disaggregated Memory
+# SHINE GPU: Disaggregated GPU Vamana Index
 
-Implementation of a distributed HNSW index for memory disaggregation. 
-This is the source code of the paper "SHINE: A Scalable HNSW Index in Disaggregated Memory".
+Implementation of a GPU-accelerated Vamana index for memory disaggregation.
+This repository is used as a storage-compute disaggregated GPU vector-search baseline.
 
 ## Setup
 
@@ -42,9 +42,9 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 ```
 
-This produces two binaries:
+This produces these main binaries:
 - `build/shine`: online memory/compute node service
-- `build/shine_offline_builder`: offline hnswlib-based graph builder that exports SHINE shard files
+- `build/vamana_offline_builder`: offline Vamana builder that exports SHINE GPU shard files plus RaBitQ artifacts
 
 ## Download the Data
 
@@ -76,28 +76,33 @@ Then, adjust the path in `config.py`.
 
 ## Offline Build And Online Load
 
-The project now supports building the HNSW graph offline with `hnswlib` and exporting it into SHINE's native
-memory-node shard format.
-
-The required `hnswlib` headers are vendored under `thirdparty/hnswlib`, so a normal `git clone` is enough. No
-extra submodule initialization is needed.
+The project supports building a Vamana graph offline and exporting it into SHINE GPU's native
+memory-node shard format. The offline build also emits RaBitQ search artifacts used by the online
+GPU query path.
 
 Build an offline index:
 ```bash
-./scripts/build_offline_index.sh \
+./build/vamana_offline_builder \
   --data-path /path/to/dataset-or-dir \
   --memory-nodes 2 \
   --threads 32 \
-  --m 32 \
-  --ef-construction 200 \
+  --R 32 \
+  --beam-width-construction 128 \
+  --alpha 1.2 \
+  --rabitq-bits 4 \
   --output-prefix /path/to/index/shine_index
 ```
+
+The offline builder has only one beam-width knob, and it is the construction/search width used
+while building the Vamana graph. It is separate from the online service's `beam-width` and
+`beam-width-construction` settings used during query and dynamic insert.
 
 This writes files like:
 ```text
 /path/to/index/shine_index_node1_of2.dat
 /path/to/index/shine_index_node2_of2.dat
 /path/to/index/shine_index.meta.json
+/path/to/index/shine_index.rotation.bin
 ```
 
 Then start each memory node with its local shard:
@@ -111,6 +116,15 @@ Or let the compute-node initiator trigger startup loading on all memory nodes:
 ```
 
 In both cases, the online cluster reuses the offline-built graph directly instead of rebuilding it through RDMA.
+When `--search-mode rabitq_gpu` is enabled on the compute side, the online service loads
+`<index_prefix>.rotation.bin` and uploads the rotation matrix, rotated centroid, and `t_const`
+to each GPU worker.
+
+### Search Modes
+
+- `exact_gpu`: GPU exact distance search over remotely fetched full vectors. Useful as an ablation and correctness reference.
+- `rabitq_gpu`: GPU RaBitQ search with final exact rerank. This is the intended paper baseline mode when evaluating
+  the disaggregated GPU index without cache or GPU-direct transport optimizations.
 
 `--servers` can now be specified either as plain node names such as `cluster3` or as explicit `host:port`
 endpoints such as `127.0.0.1:1235`. This allows running multiple memory nodes on the same machine as long as each

@@ -14,6 +14,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -25,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -62,7 +64,7 @@ struct VamanaBuildConfig {
   u32 num_memory_nodes{1};
   u32 threads{0};
   u32 R{64};                // max out-degree
-  u32 beam_width{128};      // search beam width
+  u32 beam_width{128};      // beam width used by beam search during offline construction
   f64 alpha{1.2};           // RobustPrune diversity factor
   u32 rabitq_bits{1};       // bits per dimension
   i32 seed{1234};
@@ -872,6 +874,104 @@ struct RaBitQState {
   u32 total_rabitq_bytes{0};        // packed_bytes + 8 (add + rescale)
 };
 
+constexpr std::array<float, 9> kTightStart = {
+  0.0f,
+  0.15f,
+  0.20f,
+  0.52f,
+  0.59f,
+  0.71f,
+  0.75f,
+  0.77f,
+  0.81f
+};
+
+double best_rescale_factor(const float* abs_unit_residual, size_t dim, size_t bits_per_dim) {
+  constexpr double kEps = 1e-5;
+  constexpr int kNEnum = 10;
+
+  const double max_o = *std::max_element(abs_unit_residual, abs_unit_residual + dim);
+  if (max_o <= 0.0) {
+    return 0.0;
+  }
+
+  const double t_end = static_cast<double>(((1u << bits_per_dim) - 1u) + kNEnum) / max_o;
+  const double t_start = t_end * kTightStart.at(bits_per_dim);
+
+  vec<int> cur_o_bar(dim);
+  double sqr_denominator = static_cast<double>(dim) * 0.25;
+  double numerator = 0.0;
+
+  for (size_t i = 0; i < dim; ++i) {
+    const int cur = static_cast<int>((t_start * abs_unit_residual[i]) + kEps);
+    cur_o_bar[i] = cur;
+    sqr_denominator += static_cast<double>(cur) * cur + cur;
+    numerator += (static_cast<double>(cur) + 0.5) * abs_unit_residual[i];
+  }
+
+  std::priority_queue<std::pair<double, size_t>,
+                      vec<std::pair<double, size_t>>,
+                      std::greater<>> next_t;
+  for (size_t i = 0; i < dim; ++i) {
+    if (abs_unit_residual[i] > 0.0f) {
+      next_t.emplace(static_cast<double>(cur_o_bar[i] + 1) / abs_unit_residual[i], i);
+    }
+  }
+
+  double max_ip = 0.0;
+  double best_t = 0.0;
+  while (!next_t.empty()) {
+    const auto [cur_t, update_id] = next_t.top();
+    next_t.pop();
+
+    cur_o_bar[update_id]++;
+    const int update_o_bar = cur_o_bar[update_id];
+    sqr_denominator += 2.0 * update_o_bar;
+    numerator += abs_unit_residual[update_id];
+
+    const double cur_ip = numerator / std::sqrt(sqr_denominator);
+    if (cur_ip > max_ip) {
+      max_ip = cur_ip;
+      best_t = cur_t;
+    }
+
+    if (update_o_bar < static_cast<int>((1u << bits_per_dim) - 1u)) {
+      const double t_next = static_cast<double>(update_o_bar + 1) / abs_unit_residual[update_id];
+      if (t_next < t_end) {
+        next_t.emplace(t_next, update_id);
+      }
+    }
+  }
+
+  return best_t;
+}
+
+double get_const_scaling_factors(size_t dim, size_t bits_per_dim, uint64_t seed) {
+  constexpr size_t n_samples = 1000;
+  std::mt19937_64 rng(seed);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+
+  vec<float> sample(dim);
+  vec<float> abs_unit(dim);
+  double total = 0.0;
+
+  for (size_t sample_id = 0; sample_id < n_samples; ++sample_id) {
+    double norm_sqr = 0.0;
+    for (size_t d = 0; d < dim; ++d) {
+      sample[d] = normal(rng);
+      norm_sqr += static_cast<double>(sample[d]) * sample[d];
+    }
+    const double norm = std::sqrt(norm_sqr);
+    const double inv_norm = norm > 0.0 ? (1.0 / norm) : 0.0;
+    for (size_t d = 0; d < dim; ++d) {
+      abs_unit[d] = std::fabs(static_cast<float>(sample[d] * inv_norm));
+    }
+    total += best_rescale_factor(abs_unit.data(), dim, bits_per_dim);
+  }
+
+  return total / static_cast<double>(n_samples);
+}
+
 /**
  * Initialize RaBitQ: generate random orthogonal matrix via QR decomposition.
  */
@@ -897,6 +997,12 @@ RaBitQState init_rabitq(const Dataset& dataset, u32 bits_per_dim, int seed) {
 
   Eigen::HouseholderQR<Eigen::MatrixXf> qr(random_mat);
   state.rotation_matrix = qr.householderQ() * Eigen::MatrixXf::Identity(dim, dim);
+  Eigen::MatrixXf r = state.rotation_matrix.transpose() * random_mat;
+  for (u32 i = 0; i < dim; ++i) {
+    if (r(i, i) < 0.0f) {
+      state.rotation_matrix.col(i) *= -1.0f;
+    }
+  }
 
   // Compute centroid
   std::cerr << "computing centroid...\n";
@@ -907,14 +1013,12 @@ RaBitQState init_rabitq(const Dataset& dataset, u32 bits_per_dim, int seed) {
   }
   centroid /= static_cast<float>(n);
 
-  // Rotate centroid
+  // Rotate centroid with the same transform later used by quantization.
   Eigen::VectorXf rot_centroid = state.rotation_matrix.transpose() * centroid;
   state.rotated_centroid.assign(rot_centroid.data(), rot_centroid.data() + dim);
 
-  // Compute t_const: expected norm of quantization for the given bits
-  // For 1-bit: t = 1/sqrt(dim), for multi-bit: t = (2^bits - 1) / (2 * sqrt(dim))
-  const u32 num_levels = (1u << bits_per_dim) - 1;
-  state.t_const = static_cast<double>(num_levels) / (2.0 * std::sqrt(static_cast<double>(dim)));
+  // Match Jasper's sampled constant scaling factor instead of the earlier simplified approximation.
+  state.t_const = get_const_scaling_factors(dim, bits_per_dim, static_cast<uint64_t>(seed));
 
   return state;
 }
@@ -928,6 +1032,7 @@ void rabitq_quantize_vector(const float* vector,
                             byte_t* output) {
   const u32 dim = state.dim;
   const u32 bits = state.bits_per_dim;
+  constexpr double kEps = 1e-5;
 
   // Rotate vector: x' = P^T * x
   Eigen::Map<const Eigen::VectorXf> v(vector, dim);
@@ -938,63 +1043,58 @@ void rabitq_quantize_vector(const float* vector,
   for (u32 i = 0; i < dim; ++i)
     delta[i] = rotated(i) - state.rotated_centroid[i];
 
-  // Compute norm of delta
-  float delta_norm = 0.0f;
-  for (u32 i = 0; i < dim; ++i) delta_norm += delta[i] * delta[i];
-  delta_norm = std::sqrt(delta_norm);
+  float l2_sqr = 0.0f;
+  for (u32 i = 0; i < dim; ++i) l2_sqr += delta[i] * delta[i];
+  const float l2_norm = std::sqrt(l2_sqr);
 
-  // Normalize delta
-  vec<float> normalized(dim);
-  if (delta_norm > 1e-12f) {
-    for (u32 i = 0; i < dim; ++i) normalized[i] = delta[i] / delta_norm;
-  }
-
-  // Quantize to bits_per_dim bits
-  // 1-bit: sign quantization: 0 if < 0, 1 if >= 0
-  // multi-bit: uniform quantization of [-1, 1] to [0, 2^bits-1]
-  const u32 num_levels = (1u << bits) - 1;
-  vec<u8> quantized_vals(dim);
-
-  float sum_quantized = 0.0f;  // sum of quantized values (for add factor)
+  vec<u8> quantized_vals(dim, 0);
+  float ip_norm = 0.0f;
+  const u32 magnitude_cap = (1u << (bits - 1)) - 1u;
   for (u32 i = 0; i < dim; ++i) {
-    if (bits == 1) {
-      quantized_vals[i] = (normalized[i] >= 0.0f) ? 1 : 0;
-    } else {
-      // Map [-1, 1] to [0, num_levels]
-      float clamped = std::clamp(normalized[i], -1.0f, 1.0f);
-      float scaled = (clamped + 1.0f) * 0.5f * static_cast<float>(num_levels);
-      quantized_vals[i] = static_cast<u8>(std::round(scaled));
+    const float abs_o = l2_norm > 0.0f ? std::fabs(delta[i] / l2_norm) : 0.0f;
+    int val = static_cast<int>((state.t_const * abs_o) + kEps);
+    if (val >= static_cast<int>(1u << (bits - 1))) {
+      val = static_cast<int>((1u << (bits - 1)) - 1u);
     }
-    sum_quantized += static_cast<float>(quantized_vals[i]);
+    quantized_vals[i] = static_cast<u8>(val);
+    ip_norm += (static_cast<float>(val) + 0.5f) * abs_o;
+  }
+  const float ip_norm_inv = ip_norm == 0.0f ? 1.0f : (1.0f / ip_norm);
+
+  for (u32 i = 0; i < dim; ++i) {
+    if (delta[i] >= 0.0f) {
+      quantized_vals[i] = static_cast<u8>(quantized_vals[i] + (1u << (bits - 1)));
+    } else {
+      quantized_vals[i] = static_cast<u8>((~quantized_vals[i]) & magnitude_cap);
+    }
   }
 
   // Pack bits into bytes
   std::memset(output, 0, state.packed_bytes);
-  if (bits == 1) {
-    for (u32 i = 0; i < dim; ++i) {
-      if (quantized_vals[i]) {
-        output[i / 8] |= (1 << (i % 8));
-      }
-    }
-  } else if (bits == 2) {
-    for (u32 i = 0; i < dim; ++i) {
-      output[i / 4] |= (quantized_vals[i] & 0x3) << ((i % 4) * 2);
-    }
-  } else if (bits == 4) {
-    for (u32 i = 0; i < dim; ++i) {
-      output[i / 2] |= (quantized_vals[i] & 0xF) << ((i % 2) * 4);
-    }
-  } else {  // 8 bits
-    for (u32 i = 0; i < dim; ++i) {
-      output[i] = quantized_vals[i];
+  for (u32 i = 0; i < dim; ++i) {
+    const u32 bit_idx = i * bits;
+    const u32 byte_idx = bit_idx / 8;
+    const u32 bit_off = bit_idx % 8;
+    output[byte_idx] |= static_cast<byte_t>(quantized_vals[i] << bit_off);
+    if (bit_off + bits > 8 && byte_idx + 1 < state.packed_bytes) {
+      output[byte_idx + 1] |= static_cast<byte_t>(quantized_vals[i] >> (8 - bit_off));
     }
   }
 
-  // Compute add and rescale factors
-  // add = sum_quantized / dim  (for bias correction in distance estimation)
-  // rescale = delta_norm (for scaling back to original distances)
-  float add_factor = sum_quantized / static_cast<float>(dim);
-  float rescale_factor = delta_norm;
+  const float cb = -(static_cast<float>(1u << (bits - 1)) - 0.5f);
+  float ip_resi_xucb = 0.0f;
+  float ip_cent_xucb = 0.0f;
+  for (u32 i = 0; i < dim; ++i) {
+    const float xu_cb = static_cast<float>(quantized_vals[i]) + cb;
+    ip_resi_xucb += delta[i] * xu_cb;
+    ip_cent_xucb += state.rotated_centroid[i] * xu_cb;
+  }
+  if (ip_resi_xucb == 0.0f) {
+    ip_resi_xucb = std::numeric_limits<float>::infinity();
+  }
+
+  const float add_factor = l2_sqr + 2.0f * l2_sqr * ip_cent_xucb / ip_resi_xucb;
+  const float rescale_factor = ip_norm_inv * -2.0f * l2_norm;
 
   byte_t* trailer = output + state.packed_bytes;
   std::memcpy(trailer, &add_factor, sizeof(float));
@@ -1151,6 +1251,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"dim", dim},
     {"R", config.R},
     {"beam_width", config.beam_width},
+    {"beam_width_construction", config.beam_width},
     {"alpha", config.alpha},
     {"rabitq_bits", config.rabitq_bits},
     {"num_memory_nodes", config.num_memory_nodes},
@@ -1189,7 +1290,11 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Number of threads. 0 = hardware concurrency.")
     ("R", po::value<u32>(&config.R)->default_value(config.R), "Maximum out-degree.")
     ("beam-width", po::value<u32>(&config.beam_width)->default_value(config.beam_width),
-     "Beam width for search during construction.")
+     "Beam width for beam search during offline construction.")
+    ("beam-width-construction", po::value<u32>(&config.beam_width),
+     "Alias for --beam-width. Offline builder only has a construction beam width.")
+    ("ef-construction", po::value<u32>(&config.beam_width),
+     "Alias for --beam-width in the offline builder.")
     ("alpha", po::value<f64>(&config.alpha)->default_value(config.alpha), "RobustPrune alpha parameter.")
     ("rabitq-bits", po::value<u32>(&config.rabitq_bits)->default_value(config.rabitq_bits),
      "Bits per dimension for RaBitQ (1, 2, 4, or 8).")
@@ -1242,7 +1347,7 @@ int main(int argc, char** argv) {
   std::cerr << "output prefix: " << output_prefix << "\n";
   std::cerr << "memory nodes: " << config.num_memory_nodes << "\n";
   std::cerr << "threads: " << effective_thread_count(config.threads) << "\n";
-  std::cerr << "R=" << config.R << " beam_width=" << config.beam_width
+  std::cerr << "R=" << config.R << " construction_beam_width=" << config.beam_width
             << " alpha=" << config.alpha << " rabitq_bits=" << config.rabitq_bits << "\n";
 
   const auto build_start = std::chrono::steady_clock::now();
