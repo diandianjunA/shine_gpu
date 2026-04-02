@@ -6,7 +6,7 @@
  * Replaces HNSW with a single-layer directed graph using:
  *  - Beam search (instead of multi-layer greedy descent)
  *  - RobustPrune (alpha-based diversity pruning instead of HNSW heuristic)
- *  - RaBitQ approximate distances for search (GPU-accelerated)
+ *  - Exact L2 distances for search (GPU-accelerated)
  *  - Full-precision L2 distances for insert/prune (GPU-accelerated)
  *  - Coroutine-based RDMA overlap (from SHINE)
  */
@@ -73,20 +73,11 @@ public:
             }
         }
 
-        // Upload query vector and prepare RaBitQ query factors once.
+        // Upload query vector to GPU once.
         auto& gs = gpu.state(coro_id);
         std::memcpy(gs.h_query, components.data(), dim_ * sizeof(float));
         cudaMemcpyAsync(gs.d_query, gs.h_query, dim_ * sizeof(float),
                         cudaMemcpyHostToDevice, gs.stream);
-        gpu::launch_rabitq_query_prepare(
-            gs.stream, gs.event,
-            gs.d_query,
-            gpu.d_rotation_matrix(),
-            gpu.d_centroid(),
-            gs.d_rot_query,
-            gs.d_query_factor,
-            dim_, rabitq_bits_);
-        co_await gpu::GpuAwaitable{thread.get()};
 
         // Initialize beam with medoid (exact L2 distance)
         distance_t medoid_dist = Distance::dist(components, medoid_node->components(), VamanaNode::DIM);
@@ -97,7 +88,7 @@ public:
         visited.clear();
         visited.insert(medoid_ptr);
 
-        // Beam search loop using RaBitQ approximate distances on GPU.
+        // Beam search loop using exact L2 distances on GPU.
         while (true) {
             // Find closest unexpanded candidate
             i32 best_idx = -1;
@@ -129,26 +120,24 @@ public:
 
             if (unvisited.empty()) continue;
 
-            // Batch RDMA read RaBitQ payloads and score them on GPU.
-            vec<byte_t*> rabitq_bufs = co_await rdma::vamana::batch_read_rabitq(unvisited, thread);
+            // Batch RDMA read full vectors for exact distance computation.
+            vec<byte_t*> vec_bufs = co_await rdma::vamana::batch_read_vectors(unvisited, thread);
             const u32 n_batch = unvisited.size();
             for (u32 i = 0; i < n_batch; ++i) {
-                std::memcpy(gs.h_rabitq_vecs + i * VamanaNode::RABITQ_SIZE,
-                           rabitq_bufs[i],
-                           VamanaNode::RABITQ_SIZE);
-                thread->buffer_allocator.free_buffer(rabitq_bufs[i], VamanaNode::RABITQ_SIZE);
+                std::memcpy(gs.h_candidate_vecs + i * dim_,
+                           reinterpret_cast<float*>(vec_bufs[i]),
+                           dim_ * sizeof(float));
+                thread->buffer_allocator.free_buffer(vec_bufs[i], dim_ * sizeof(element_t));
             }
 
-            cudaMemcpyAsync(gs.d_rabitq_vecs, gs.h_rabitq_vecs,
-                           n_batch * VamanaNode::RABITQ_SIZE,
+            cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
+                           n_batch * dim_ * sizeof(float),
                            cudaMemcpyHostToDevice, gs.stream);
 
-            gpu::launch_batch_rabitq_distances(
+            gpu::launch_batch_l2_distances(
                 gs.stream, gs.event,
-                gs.d_rot_query,
-                gs.d_query_factor,
-                gs.d_rabitq_vecs,
-                gs.d_distances, n_batch, dim_, rabitq_bits_);
+                gs.d_query, gs.d_candidate_vecs,
+                gs.d_distances, n_batch, dim_);
             co_await gpu::GpuAwaitable{thread.get()};
 
             // Copy distances back
