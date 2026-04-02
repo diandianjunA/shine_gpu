@@ -40,16 +40,17 @@ inline auto read_vamana_node(RemotePtr rptr, const u_ptr<ComputeThread>& thread)
     struct awaitable {
         RemotePtr rptr;
         byte_t* node_ptr;
+        size_t read_size;
         const u_ptr<ComputeThread>& thread;
 
         static bool await_ready() { return false; }
         static void await_suspend(std::coroutine_handle<>) {}
         s_ptr<VamanaNode> await_resume() {
-            return std::make_shared<VamanaNode>(node_ptr, rptr, thread.get());
+            return std::make_shared<VamanaNode>(node_ptr, read_size, rptr, thread.get());
         }
     };
 
-    return awaitable{rptr, node_ptr, thread};
+    return awaitable{rptr, node_ptr, read_size, thread};
 }
 
 /**
@@ -77,16 +78,17 @@ inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& th
     struct awaitable {
         RemotePtr rptr;
         byte_t* node_ptr;
+        size_t read_size;
         const u_ptr<ComputeThread>& thread;
 
         static bool await_ready() { return false; }
         static void await_suspend(std::coroutine_handle<>) {}
         s_ptr<VamanaNode> await_resume() {
-            return std::make_shared<VamanaNode>(node_ptr, rptr, thread.get());
+            return std::make_shared<VamanaNode>(node_ptr, read_size, rptr, thread.get());
         }
     };
 
-    return awaitable{rptr, node_ptr, thread};
+    return awaitable{rptr, node_ptr, read_size, thread};
 }
 
 /**
@@ -117,6 +119,7 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
 
     struct awaitable {
         byte_t* local_buffer;
+        size_t read_size;
         const u_ptr<ComputeThread>& thread;
 
         static bool await_ready() { return false; }
@@ -129,11 +132,11 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
             std::memmove(local_buffer + sizeof(u8),
                         local_buffer + (VamanaNode::offset_neighbors() - VamanaNode::offset_edge_count()),
                         VamanaNode::NEIGHBORS_SIZE);
-            return std::make_shared<VamanaNeighborlist>(local_buffer, thread.get());
+            return std::make_shared<VamanaNeighborlist>(local_buffer, read_size, thread.get());
         }
     };
 
-    return awaitable{local_buffer, thread};
+    return awaitable{local_buffer, read_size, thread};
 }
 
 /**
@@ -266,7 +269,7 @@ inline auto read_vamana_nodes(const span<RemotePtr> remote_ptrs, const u_ptr<Com
 
     for (auto& rptr : remote_ptrs) {
         byte_t* node_ptr = thread->buffer_allocator.allocate_buffer(read_size);
-        nodes.emplace_back(std::make_shared<VamanaNode>(node_ptr, rptr, thread.get()));
+        nodes.emplace_back(std::make_shared<VamanaNode>(node_ptr, read_size, rptr, thread.get()));
 
         thread->stats.rdma_reads_in_bytes += read_size;
         thread->track_post();

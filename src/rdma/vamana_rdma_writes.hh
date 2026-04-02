@@ -107,6 +107,7 @@ inline auto write_vamana_node(const RemotePtr& rptr,
 
     struct awaitable {
         byte_t* local_buffer;
+        size_t total_size;
         const RemotePtr& rptr;
         const u_ptr<ComputeThread>& thread;
 
@@ -114,11 +115,11 @@ inline auto write_vamana_node(const RemotePtr& rptr,
         static void await_suspend(std::coroutine_handle<>) {}
 
         s_ptr<VamanaNode> await_resume() {
-            return std::make_shared<VamanaNode>(local_buffer, rptr, thread.get());
+            return std::make_shared<VamanaNode>(local_buffer, total_size, rptr, thread.get());
         }
     };
 
-    return awaitable{local_buffer, rptr, thread};
+    return awaitable{local_buffer, total, rptr, thread};
 }
 
 /**
@@ -178,7 +179,22 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
                   0,
                   thread->create_wr_id());
 
-    return std::suspend_always{};
+    struct awaitable {
+        byte_t* meta_buffer;
+        byte_t* nbr_buffer;
+        size_t meta_size;
+        size_t nbr_size;
+        const u_ptr<ComputeThread>& thread;
+
+        static bool await_ready() { return false; }
+        static void await_suspend(std::coroutine_handle<>) {}
+        void await_resume() {
+            thread->buffer_allocator.free_buffer(meta_buffer, meta_size);
+            thread->buffer_allocator.free_buffer(nbr_buffer, nbr_size);
+        }
+    };
+
+    return awaitable{meta_buffer, nbr_buffer, meta_size, VamanaNode::NEIGHBORS_SIZE, thread};
 }
 
 /**
