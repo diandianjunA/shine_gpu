@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <library/connection_manager.hh>
 #include <library/memory_region.hh>
@@ -15,6 +16,7 @@
 #include "common/core_assignment.hh"
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node.hh"
+#include "service/breakdown.hh"
 #include "service/rabitq_artifacts.hh"
 #include "vamana/vamana.hh"
 #include "worker_pool.hh"
@@ -90,6 +92,9 @@ public:
   bool load_index(const std::string& path, str* error_message = nullptr);
   bool store_index(const std::string& path, str* error_message = nullptr);
   Status status() const;
+  void reset_breakdown_state();
+  void clear_thread_statistics();
+  service::breakdown::Report collect_breakdown_report() const;
 
   const Configuration& config() const { return config_; }
 
@@ -178,6 +183,11 @@ private:
   vec<u32> routing_inflight_;
   std::atomic<u32> registered_remote_clients_{0};
   std::condition_variable routing_cv_;
+
+  mutable std::mutex breakdown_mutex_;
+  bool breakdown_enabled_{false};
+  std::vector<service::breakdown::Sample> completed_query_samples_;
+  std::vector<service::breakdown::Sample> completed_insert_samples_;
 };
 
 extern template class ComputeService<L2Distance>;

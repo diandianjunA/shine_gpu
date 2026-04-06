@@ -58,6 +58,13 @@ inline MinorCoroutine spinlock_vamana_node(const s_ptr<VamanaNode>& node,
     do {
         std::tie(success, original_header) =
             co_await try_lock_vamana_node(node->rptr, node->header(), thread);
+        if (auto* sample = thread->current_breakdown_sample()) {
+            ++sample->lock_attempts;
+            if (!success) {
+                ++sample->lock_retries;
+                ++sample->cas_failures;
+            }
+        }
         node->header() = original_header;
         ++attempts;
         if (!success && attempts % 100000 == 0) {

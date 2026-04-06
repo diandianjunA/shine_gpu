@@ -100,6 +100,14 @@ if (SHINE_BUILD_EXECUTABLES)
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
     )
     target_link_libraries(vamana_offline_builder rdma_library Eigen3::Eigen shine_gpu_kernels CUDA::cudart CUDA::cublas)
+
+    add_executable(shine_breakdown_benchmark tools/shine_breakdown_benchmark.cc)
+    target_include_directories(shine_breakdown_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+    )
+    target_link_libraries(shine_breakdown_benchmark shine_runtime)
 endif ()
 
 if (SHINE_BUILD_TESTS)

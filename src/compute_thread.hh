@@ -8,6 +8,7 @@
 #include "common/statistics.hh"
 #include "coroutine.hh"
 #include "gpu/gpu_buffer_manager.hh"
+#include "service/breakdown.hh"
 #include "shared_context.hh"
 
 // forward declaration
@@ -33,7 +34,8 @@ public:
         cache(cache),
         post_balances(num_coroutines),
         gpu_post_balances(num_coroutines),
-        max_send_queue_wr_(max_send_queue_wr) {
+        max_send_queue_wr_(max_send_queue_wr),
+        active_samples_(num_coroutines, nullptr) {
     for (auto& balance : post_balances) {
       balance.store(0, std::memory_order_relaxed);
     }
@@ -69,6 +71,7 @@ public:
     for (auto& balance : gpu_post_balances) {
       balance.store(0, std::memory_order_relaxed);
     }
+    std::fill(active_samples_.begin(), active_samples_.end(), nullptr);
   }
 
   u32 get_random_memory_node() { return dist_(generator_); }
@@ -83,6 +86,9 @@ public:
   u32 current_coroutine_id() const { return running_coroutine_; }
   VamanaCoroutine& current_vamana_coroutine() const { return *vamana_coroutines[running_coroutine_]; }
   u64* coros_pointer_slot() const { return pointer_slots_[running_coroutine_]; }
+  void set_active_sample(u32 coroutine_id, service::breakdown::Sample* sample) { active_samples_[coroutine_id] = sample; }
+  service::breakdown::Sample* active_sample(u32 coroutine_id) const { return active_samples_[coroutine_id]; }
+  service::breakdown::Sample* current_breakdown_sample() const { return active_samples_[running_coroutine_]; }
   void set_service_role(ServiceWorkerRole role) { service_role_ = role; }
   ServiceWorkerRole service_role() const { return service_role_; }
   bool is_query_worker() const { return service_role_ == ServiceWorkerRole::query; }
@@ -119,6 +125,7 @@ private:
   const i32 max_send_queue_wr_;
   u32 running_coroutine_{};  // tracks the id of the currently running coroutine
   vec<u64*> pointer_slots_;  // memory region for a single pointer per coroutine
+  vec<service::breakdown::Sample*> active_samples_;
   ServiceWorkerRole service_role_{ServiceWorkerRole::none};
 
   std::mt19937 generator_{std::random_device{}()};

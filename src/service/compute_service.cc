@@ -127,17 +127,26 @@ template <class Distance>
 size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
   vec<service::InsertRequest*> requests;
   vec<std::future<bool>> futures;
+  vec<std::shared_ptr<service::breakdown::Sample>> samples;
   requests.reserve(batch.size());
   futures.reserve(batch.size());
+  samples.reserve(batch.size());
 
   for (const auto& item : batch) {
     if (item.values.size() != config_.dim) {
       throw std::invalid_argument("insert dimension mismatch");
     }
 
-    auto* request = new service::InsertRequest{item.id, item.values, {}};
+    std::shared_ptr<service::breakdown::Sample> sample;
+    if (breakdown_enabled_) {
+      sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
+      sample->enqueued_at = std::chrono::steady_clock::now();
+    }
+
+    auto* request = new service::InsertRequest{item.id, item.values, {}, std::chrono::steady_clock::now(), sample};
     futures.push_back(request->result.get_future());
     requests.push_back(request);
+    samples.push_back(sample);
     insert_queue_.enqueue(request);
   }
 
@@ -146,6 +155,10 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     const bool ok = futures[i].get();
     if (ok) {
       ++inserted;
+    }
+    if (samples[i] && samples[i]->finished_flag) {
+      std::lock_guard<std::mutex> lock(breakdown_mutex_);
+      completed_insert_samples_.push_back(*samples[i]);
     }
   }
   vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
@@ -163,11 +176,21 @@ vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, 
     throw std::invalid_argument("search dimension mismatch");
   }
 
-  auto* request = new service::QueryRequest{query, k, {}};
+  std::shared_ptr<service::breakdown::Sample> sample;
+  if (breakdown_enabled_) {
+    sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::query);
+    sample->enqueued_at = std::chrono::steady_clock::now();
+  }
+
+  auto* request = new service::QueryRequest{query, k, {}, std::chrono::steady_clock::now(), sample};
   auto future = request->result.get_future();
   query_queue_.enqueue(request);
 
   vec<node_t> results = future.get();
+  if (sample && sample->finished_flag) {
+    std::lock_guard<std::mutex> lock(breakdown_mutex_);
+    completed_query_samples_.push_back(*sample);
+  }
   delete request;
 
   if (results.size() > k) {
@@ -296,6 +319,34 @@ typename ComputeService<Distance>::Status ComputeService<Distance>::status() con
     .dimension = config_.dim,
     .threads = config_.num_threads,
   };
+}
+
+template <class Distance>
+void ComputeService<Distance>::reset_breakdown_state() {
+  std::lock_guard<std::mutex> lock(breakdown_mutex_);
+  completed_query_samples_.clear();
+  completed_insert_samples_.clear();
+  breakdown_enabled_ = true;
+}
+
+template <class Distance>
+void ComputeService<Distance>::clear_thread_statistics() {
+  for (auto& thread : compute_threads()) {
+    thread->stats = statistics::ThreadStatistics{};
+  }
+}
+
+template <class Distance>
+service::breakdown::Report ComputeService<Distance>::collect_breakdown_report() const {
+  service::breakdown::Report report;
+  std::lock_guard<std::mutex> lock(breakdown_mutex_);
+  for (const auto& sample : completed_query_samples_) {
+    service::breakdown::add_sample(report.query, sample);
+  }
+  for (const auto& sample : completed_insert_samples_) {
+    service::breakdown::add_sample(report.insert, sample);
+  }
+  return report;
 }
 
 template <class Distance>

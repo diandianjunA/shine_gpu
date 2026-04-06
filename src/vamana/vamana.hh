@@ -12,6 +12,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cuda_runtime.h>
 
 #include "cache/cache.hh"
@@ -70,15 +71,19 @@ public:
                    "rabitq_gpu search requested before RaBitQ artifacts were loaded");
 
         // Read medoid
+        const auto t_medoid_ptr_start = std::chrono::steady_clock::now();
         RemotePtr medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
+        add_breakdown_phase(thread, service::breakdown::Phase::query_medoid_fetch, t_medoid_ptr_start);
 
         s_ptr<VamanaNode> medoid_node;
         {
+            const auto t_cache_start = std::chrono::steady_clock::now();
             auto coro = cache_lookup(medoid_ptr, medoid_node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
                 coro.handle.resume();
             }
+            add_breakdown_phase(thread, service::breakdown::Phase::query_medoid_fetch, t_cache_start);
         }
 
         // Upload query vector to GPU once.
@@ -88,6 +93,7 @@ public:
         track_query_h2d(thread, dim_ * sizeof(float));
 
         if (use_rabitq_search_) {
+            const auto t_gpu_prepare = std::chrono::steady_clock::now();
             gpu::launch_rabitq_query_prepare(
                 gs.stream, gs.event,
                 gpu.cublas_handle(),
@@ -99,6 +105,7 @@ public:
                 dim_, rabitq_bits_);
             ++thread->stats.query_rabitq_kernels;
             co_await gpu::GpuAwaitable{thread.get()};
+            add_breakdown_phase(thread, service::breakdown::Phase::query_gpu_prepare, t_gpu_prepare);
         }
 
         // Initialize beam with medoid (exact L2 distance)
@@ -130,8 +137,10 @@ public:
             beam[best_idx].expanded = true;
 
             // Read neighbor list of best candidate
+            const auto t_neighbor_fetch = std::chrono::steady_clock::now();
             s_ptr<VamanaNeighborlist> nlist =
                 co_await rdma::vamana::read_vamana_neighbors(beam[best_idx].rptr, thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::query_neighbor_fetch, t_neighbor_fetch);
             ++thread->stats.visited_neighborlists;
 
             // Filter unvisited neighbors
@@ -148,7 +157,9 @@ public:
 
             const u32 n_batch = unvisited.size();
             if (use_rabitq_search_) {
+                const auto t_rabitq_fetch = std::chrono::steady_clock::now();
                 vec<byte_t*> rabitq_bufs = co_await rdma::vamana::batch_read_rabitq(unvisited, thread);
+                add_breakdown_phase(thread, service::breakdown::Phase::query_rabitq_fetch, t_rabitq_fetch);
                 for (u32 i = 0; i < n_batch; ++i) {
                     std::memcpy(gs.h_rabitq_vecs + i * VamanaNode::RABITQ_SIZE,
                                rabitq_bufs[i],
@@ -161,6 +172,7 @@ public:
                                cudaMemcpyHostToDevice, gs.stream);
                 track_query_h2d(thread, n_batch * VamanaNode::RABITQ_SIZE);
 
+                const auto t_gpu_distance = std::chrono::steady_clock::now();
                 gpu::launch_batch_rabitq_distances(
                     gs.stream, gs.event,
                     gs.d_rot_query,
@@ -170,8 +182,11 @@ public:
                     n_batch, dim_, rabitq_bits_);
                 ++thread->stats.query_rabitq_kernels;
                 co_await gpu::GpuAwaitable{thread.get()};
+                add_breakdown_phase(thread, service::breakdown::Phase::query_gpu_distance, t_gpu_distance);
             } else {
+                const auto t_vector_fetch = std::chrono::steady_clock::now();
                 vec<byte_t*> vec_bufs = co_await rdma::vamana::batch_read_vectors(unvisited, thread);
+                add_breakdown_phase(thread, service::breakdown::Phase::query_vector_fetch, t_vector_fetch);
                 for (u32 i = 0; i < n_batch; ++i) {
                     std::memcpy(gs.h_candidate_vecs + i * dim_,
                                reinterpret_cast<float*>(vec_bufs[i]),
@@ -184,11 +199,13 @@ public:
                                cudaMemcpyHostToDevice, gs.stream);
                 track_query_h2d(thread, n_batch * dim_ * sizeof(float));
 
+                const auto t_gpu_distance = std::chrono::steady_clock::now();
                 gpu::launch_batch_l2_distances(
                     gs.stream, gs.event,
                     gs.d_query, gs.d_candidate_vecs,
                     gs.d_distances, n_batch, dim_);
                 co_await gpu::GpuAwaitable{thread.get()};
+                add_breakdown_phase(thread, service::breakdown::Phase::query_gpu_distance, t_gpu_distance);
             }
 
             cudaMemcpyAsync(gs.h_distances, gs.d_distances,
@@ -207,6 +224,7 @@ public:
         }
 
         if (use_rabitq_search_ && !beam.empty()) {
+            const auto t_rerank_fetch = std::chrono::steady_clock::now();
             vec<RemotePtr> rerank_ptrs;
             rerank_ptrs.reserve(beam.size());
             for (const auto& entry : beam) {
@@ -214,6 +232,7 @@ public:
             }
 
             vec<byte_t*> rerank_vec_bufs = co_await rdma::vamana::batch_read_vectors(rerank_ptrs, thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::query_vector_fetch, t_rerank_fetch);
             const u32 n_rerank = static_cast<u32>(rerank_ptrs.size());
             for (u32 i = 0; i < n_rerank; ++i) {
                 std::memcpy(gs.h_candidate_vecs + i * dim_,
@@ -227,12 +246,14 @@ public:
                            cudaMemcpyHostToDevice, gs.stream);
             track_query_h2d(thread, n_rerank * dim_ * sizeof(float));
 
+            const auto t_gpu_rerank = std::chrono::steady_clock::now();
             gpu::launch_batch_l2_distances(
                 gs.stream, gs.event,
                 gs.d_query, gs.d_candidate_vecs,
                 gs.d_distances, n_rerank, dim_);
             ++thread->stats.query_exact_reranks;
             co_await gpu::GpuAwaitable{thread.get()};
+            add_breakdown_phase(thread, service::breakdown::Phase::query_gpu_rerank, t_gpu_rerank);
 
             cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                            n_rerank * sizeof(float),
@@ -247,14 +268,17 @@ public:
             }
         }
 
+        const auto t_sort = std::chrono::steady_clock::now();
         std::sort(beam.begin(), beam.end(),
                   [](const auto& a, const auto& b) { return a.distance < b.distance; });
+        add_breakdown_phase(thread, service::breakdown::Phase::query_cpu_merge_sort, t_sort);
 
         auto& results = thread->query_results[q_id];
         results.clear();
         u32 count = std::min(k_, static_cast<u32>(beam.size()));
 
         // We need to resolve node IDs — read the nodes for top-k
+        const auto t_result_materialize = std::chrono::steady_clock::now();
         for (u32 i = 0; i < count; ++i) {
             s_ptr<VamanaNode> node;
             auto coro = cache_lookup(beam[i].rptr, node, thread, true);
@@ -264,6 +288,7 @@ public:
             }
             results.push_back(node->id());
         }
+        add_breakdown_phase(thread, service::breakdown::Phase::query_result_materialize, t_result_materialize);
 
         beam.clear();
         visited.clear();
@@ -289,11 +314,15 @@ public:
                    "rabitq_gpu insert requested before RaBitQ artifacts were loaded");
 
         // Read medoid
+        const auto t_medoid_ptr = std::chrono::steady_clock::now();
         RemotePtr medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_medoid_fetch, t_medoid_ptr);
 
         // Handle first insert (empty index)
         if (medoid_ptr.is_null()) {
+            const auto t_alloc = std::chrono::steady_clock::now();
             RemotePtr new_ptr = co_await rdma::vamana::allocate_vamana_node(thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_remote_alloc, t_alloc);
 
             // Quantize vector with GPU
             std::memcpy(gs.h_query, components.data(), dim_ * sizeof(float));
@@ -305,6 +334,7 @@ public:
             u32 rabitq_data_size = VamanaNode::RABITQ_SIZE;
             uint8_t* d_rabitq_out = reinterpret_cast<uint8_t*>(gs.d_rabitq_vecs);  // reuse buffer
 
+            const auto t_quantize = std::chrono::steady_clock::now();
             gpu::launch_rabitq_quantize_single(
                 gs.stream, gs.event,
                 gpu.cublas_handle(),
@@ -314,6 +344,7 @@ public:
                 d_rabitq_out,
                 dim_, rabitq_bits_, gpu.t_const());
             co_await gpu::GpuAwaitable{thread.get()};
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_quantize, t_quantize);
 
             // Copy RaBitQ data back
             cudaMemcpyAsync(gs.h_rabitq_vecs, d_rabitq_out, rabitq_data_size,
@@ -323,16 +354,22 @@ public:
 
             // Write node with no neighbors
             vec<RemotePtr> empty_neighbors;
+            const auto t_write = std::chrono::steady_clock::now();
             s_ptr<VamanaNode> new_node = co_await rdma::vamana::write_vamana_node(
                 new_ptr, id, components, gs.h_rabitq_vecs, span<RemotePtr>{},
                 0, false, false, thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_new_node_write, t_write);
 
             // Try to set as medoid
+            const auto t_medoid_update = std::chrono::steady_clock::now();
             RemotePtr old_medoid = co_await rdma::vamana::swap_medoid_ptr(
                 RemotePtr{}, new_ptr, thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_medoid_update, t_medoid_update);
             if (old_medoid.is_null()) {
                 // Success — we set the medoid
+                const auto t_header_write = std::chrono::steady_clock::now();
                 co_await rdma::vamana::write_vamana_header(new_ptr, true, false, false, thread);
+                add_breakdown_phase(thread, service::breakdown::Phase::insert_medoid_update, t_header_write);
                 co_return;
             }
             // Another thread won the race — fall through to normal insert
@@ -342,11 +379,13 @@ public:
         // Phase 1: Beam search for candidate neighbors
         s_ptr<VamanaNode> medoid_node;
         {
+            const auto t_cache_start = std::chrono::steady_clock::now();
             auto coro = cache_lookup(medoid_ptr, medoid_node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
                 coro.handle.resume();
             }
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_medoid_fetch, t_cache_start);
         }
 
         distance_t medoid_dist = Distance::dist(components, medoid_node->components(), VamanaNode::DIM);
@@ -378,8 +417,10 @@ public:
 
             beam[best_idx].expanded = true;
 
+            const auto t_neighbor_fetch = std::chrono::steady_clock::now();
             s_ptr<VamanaNeighborlist> nlist =
                 co_await rdma::vamana::read_vamana_neighbors(beam[best_idx].rptr, thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_candidate_search, t_neighbor_fetch);
             ++thread->stats.visited_neighborlists;
 
             vec<RemotePtr> unvisited;
@@ -394,7 +435,9 @@ public:
             if (unvisited.empty()) continue;
 
             // Batch read full vectors for exact distance
+            const auto t_vector_fetch = std::chrono::steady_clock::now();
             vec<byte_t*> vec_bufs = co_await rdma::vamana::batch_read_vectors(unvisited, thread);
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_candidate_vector_fetch, t_vector_fetch);
 
             // Stage to GPU
             const u32 n_batch = unvisited.size();
@@ -410,12 +453,14 @@ public:
                            cudaMemcpyHostToDevice, gs.stream);
             track_build_h2d(thread, n_batch * dim_ * sizeof(float));
 
+            const auto t_gpu_distance = std::chrono::steady_clock::now();
             gpu::launch_batch_l2_distances(
                 gs.stream, gs.event,
                 gs.d_query, gs.d_candidate_vecs,
                 gs.d_distances, n_batch, dim_);
             ++thread->stats.build_l2_kernels;
             co_await gpu::GpuAwaitable{thread.get()};
+            add_breakdown_phase(thread, service::breakdown::Phase::insert_gpu_distance, t_gpu_distance);
 
             cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                            n_batch * sizeof(float),
@@ -446,7 +491,9 @@ public:
         }
 
         // Batch read full vectors for all candidates (for RobustPrune)
+        const auto t_candidate_fetch = std::chrono::steady_clock::now();
         vec<byte_t*> cand_vec_bufs = co_await rdma::vamana::batch_read_vectors(candidate_rptrs, thread);
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_candidate_vector_fetch, t_candidate_fetch);
 
         // Stage to GPU: candidate vectors + distances
         for (u32 i = 0; i < n_candidates; ++i) {
@@ -465,6 +512,7 @@ public:
                        cudaMemcpyHostToDevice, gs.stream);
         track_build_h2d(thread, n_candidates * dim_ * sizeof(float) + n_candidates * sizeof(float));
 
+        const auto t_gpu_prune = std::chrono::steady_clock::now();
         gpu::launch_robust_prune(
             gs.stream, gs.event,
             gs.d_query,  // source vector (the new node being inserted)
@@ -475,6 +523,7 @@ public:
             gs.d_pruned_indices, gs.d_pruned_count);
         ++thread->stats.build_prune_kernels;
         co_await gpu::GpuAwaitable{thread.get()};
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_gpu_prune, t_gpu_prune);
 
         cudaMemcpyAsync(gs.h_pruned_indices, gs.d_pruned_indices,
                        R_ * sizeof(uint32_t),
@@ -499,6 +548,7 @@ public:
 
         // Phase 3: Quantize new vector with RaBitQ
         uint8_t* d_rabitq_out = reinterpret_cast<uint8_t*>(gs.d_rabitq_vecs);
+        const auto t_quantize = std::chrono::steady_clock::now();
         gpu::launch_rabitq_quantize_single(
             gs.stream, gs.event,
             gpu.cublas_handle(),
@@ -508,6 +558,7 @@ public:
             d_rabitq_out,
             dim_, rabitq_bits_, gpu.t_const());
         co_await gpu::GpuAwaitable{thread.get()};
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_quantize, t_quantize);
 
         u32 rabitq_data_size = VamanaNode::RABITQ_SIZE;
         cudaMemcpyAsync(gs.h_rabitq_vecs, d_rabitq_out, rabitq_data_size,
@@ -516,14 +567,19 @@ public:
         cudaStreamSynchronize(gs.stream);
 
         // Phase 4: Allocate and write new node
+        const auto t_alloc = std::chrono::steady_clock::now();
         RemotePtr new_ptr = co_await rdma::vamana::allocate_vamana_node(thread);
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_remote_alloc, t_alloc);
 
+        const auto t_new_write = std::chrono::steady_clock::now();
         s_ptr<VamanaNode> new_node = co_await rdma::vamana::write_vamana_node(
             new_ptr, id, components, gs.h_rabitq_vecs,
             span<RemotePtr>{selected_neighbors.data(), selected_neighbors.size()},
             static_cast<u8>(pruned_count), false, false, thread);
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_new_node_write, t_new_write);
 
         // Phase 5: Update reverse edges (bidirectional connectivity)
+        const auto t_neighbor_update = std::chrono::steady_clock::now();
         for (const RemotePtr& neighbor_ptr : selected_neighbors) {
             // Lock the neighbor
             s_ptr<VamanaNode> neighbor_node =
@@ -683,6 +739,7 @@ public:
             // Unlock neighbor
             co_await rdma::vamana::unlock_vamana_node(neighbor_node, thread);
         }
+        add_breakdown_phase(thread, service::breakdown::Phase::insert_neighbor_update, t_neighbor_update);
 
         beam.clear();
         visited.clear();
@@ -733,6 +790,16 @@ private:
 
     static void track_build_d2h(const u_ptr<ComputeThread>& thread, size_t bytes) {
         thread->stats.build_d2h_bytes += bytes;
+    }
+
+    static void add_breakdown_phase(const u_ptr<ComputeThread>& thread,
+                                    const service::breakdown::Phase phase,
+                                    const std::chrono::steady_clock::time_point start) {
+        if (auto* sample = thread->current_breakdown_sample()) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            sample->add_phase(phase, static_cast<u64>(elapsed));
+        }
     }
 
     // =========================================================================

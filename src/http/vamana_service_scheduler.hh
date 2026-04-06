@@ -70,6 +70,10 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
 
       if (coroutine.handle.done()) {
         if (active_requests[cid]) {
+          if (active_requests[cid]->breakdown_sample) {
+            active_requests[cid]->breakdown_sample->mark_finished(std::chrono::steady_clock::now(), thread->stats);
+            thread->set_active_sample(cid, nullptr);
+          }
           active_requests[cid]->result.set_value(true);
           active_requests[cid] = nullptr;
         }
@@ -85,6 +89,12 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
           std::copy(req->components.begin(), req->components.end(), slot_components.begin());
           staging.set_id(cid, req->id);
           active_requests[cid] = req;
+          thread->set_active_sample(cid, req->breakdown_sample.get());
+          if (req->breakdown_sample) {
+            const auto now = std::chrono::steady_clock::now();
+            req->breakdown_sample->enqueued_at = req->enqueued_at;
+            req->breakdown_sample->mark_started(now, now, thread->stats);
+          }
 
           coroutine.handle.destroy();
           reset_vamana_coroutine_state(coroutine);
@@ -166,6 +176,10 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
 
       if (coroutine.handle.done()) {
         if (active_requests[cid]) {
+          if (active_requests[cid]->breakdown_sample) {
+            active_requests[cid]->breakdown_sample->mark_finished(std::chrono::steady_clock::now(), thread->stats);
+            thread->set_active_sample(cid, nullptr);
+          }
           node_t q_id = slot_ids[cid];
           auto it = thread->query_results.find(q_id);
           if (it != thread->query_results.end()) {
@@ -187,6 +201,12 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
           auto slot_components = staging.get_components(cid);
           std::copy(req->components.begin(), req->components.end(), slot_components.begin());
           active_requests[cid] = req;
+          thread->set_active_sample(cid, req->breakdown_sample.get());
+          if (req->breakdown_sample) {
+            const auto now = std::chrono::steady_clock::now();
+            req->breakdown_sample->enqueued_at = req->enqueued_at;
+            req->breakdown_sample->mark_started(now, now, thread->stats);
+          }
 
           coroutine.handle.destroy();
           reset_vamana_coroutine_state(coroutine);
