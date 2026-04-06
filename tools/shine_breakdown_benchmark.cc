@@ -266,12 +266,21 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
   const size_t dim = service.config().dim;
   const size_t bootstrap_count = std::max<size_t>(2048, args.measure_ops * std::max<size_t>(1, args.batch_size));
+  const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
+  const bool requires_rabitq_artifacts = service.config().use_rabitq_search() &&
+                                         (args.workload == "insert" || args.workload == "both" || args.workload == "mixed");
+
+  if (requires_rabitq_artifacts && !service.config().load_index) {
+    throw std::runtime_error(
+      "mixed/insert benchmark with search-mode=rabitq_gpu requires a preloaded offline index. "
+      "Enable --load-index and provide a valid index-prefix so the .meta.json and .rotation.bin artifacts are loaded.");
+  }
+
   std::vector<uint32_t> bootstrap_ids(bootstrap_count);
   std::iota(bootstrap_ids.begin(), bootstrap_ids.end(), 1);
   const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
 
-  if ((args.workload == "query" || args.workload == "both" || args.workload == "mixed") &&
-      !service.config().load_index) {
+  if (needs_query_data && !service.config().load_index) {
     vec<typename ComputeService<Distance>::InsertItem> bootstrap_batch;
     bootstrap_batch.reserve(bootstrap_count);
     for (size_t i = 0; i < bootstrap_count; ++i) {
@@ -298,6 +307,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   std::vector<float> query_data;
   size_t query_count = 0;
   if (!args.query_file.empty()) {
+    std::ifstream probe(args.query_file, std::ios::binary);
+    if (!probe.good()) {
+      throw std::runtime_error("query file does not exist: " + args.query_file);
+    }
     uint32_t file_dim = 0;
     query_data = read_fbin(args.query_file, &file_dim, &query_count);
     if (file_dim != dim) {

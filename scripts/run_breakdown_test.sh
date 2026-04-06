@@ -79,6 +79,12 @@ if [[ ! -f "$SERVICE_CONFIG" ]]; then
     exit 1
 fi
 
+if [[ -n "$QUERY_FILE" && ! -f "$QUERY_FILE" ]]; then
+    echo "错误: QUERY_FILE 不存在或不是有效文件: $QUERY_FILE"
+    echo "如果想使用 synthetic query，请不要设置 QUERY_FILE。"
+    exit 1
+fi
+
 if [[ ! -x "$BINARY" ]]; then
     echo "错误: 找不到可执行文件 $BINARY"
     echo "请先编译项目: cd $PROJECT_DIR && mkdir -p build && cd build && cmake .. && make -j"
