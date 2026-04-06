@@ -2,6 +2,7 @@
 #include <atomic>
 #include <barrier>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -244,6 +245,57 @@ std::vector<float> read_fbin(const std::string& path, uint32_t* dim_out, size_t*
   return data;
 }
 
+class ProgressReporter {
+public:
+  ProgressReporter(std::string label, size_t total_ops, const std::atomic<size_t>& completed_ops)
+      : label_(std::move(label)), total_ops_(std::max<size_t>(total_ops, 1)), completed_ops_(completed_ops),
+        start_(std::chrono::steady_clock::now()),
+        thread_([this]() { run(); }) {}
+
+  ~ProgressReporter() { finish(); }
+
+  void finish() {
+    finished_.store(true, std::memory_order_release);
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+private:
+  void run() {
+    size_t last_completed = 0;
+    while (!finished_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      const size_t completed = completed_ops_.load(std::memory_order_relaxed);
+      const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+      const double rate = elapsed <= 0.0 ? 0.0 : static_cast<double>(completed) / elapsed;
+      std::cerr << "[breakdown][" << label_ << "] progress " << completed << "/" << total_ops_
+                << " ops, rate=" << rate << " ops/s" << std::endl;
+      if (completed >= total_ops_) {
+        break;
+      }
+      if (completed == last_completed && completed > 0) {
+        std::cerr << "[breakdown][" << label_ << "] still running, no new completions in last interval"
+                  << std::endl;
+      }
+      last_completed = completed;
+    }
+
+    const size_t completed = completed_ops_.load(std::memory_order_relaxed);
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+    const double rate = elapsed <= 0.0 ? 0.0 : static_cast<double>(completed) / elapsed;
+    std::cerr << "[breakdown][" << label_ << "] done " << completed << "/" << total_ops_
+              << " ops, avg_rate=" << rate << " ops/s" << std::endl;
+  }
+
+  std::string label_;
+  size_t total_ops_;
+  const std::atomic<size_t>& completed_ops_;
+  std::chrono::steady_clock::time_point start_;
+  std::atomic<bool> finished_{false};
+  std::thread thread_;
+};
+
 template <class Distance>
 nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args) {
   using SampleReport = service::breakdown::Report;
@@ -291,7 +343,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     root["meta"]["bootstrap_vectors"] = bootstrap_count;
   }
 
-  auto run_insert_phase = [&](size_t ops, uint32_t start_id) {
+  auto run_insert_phase = [&](const std::string& label, size_t ops, uint32_t start_id) {
+    std::atomic<size_t> completed_ops{0};
+    ProgressReporter reporter(label, ops, completed_ops);
     for (size_t op = 0; op < ops; ++op) {
       vec<typename ComputeService<Distance>::InsertItem> batch;
       batch.reserve(args.batch_size);
@@ -301,7 +355,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         batch.push_back({id, vec<element_t>(values.begin(), values.end())});
       }
       service.insert(batch);
+      completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
+    reporter.finish();
   };
 
   std::vector<float> query_data;
@@ -321,22 +377,28 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     query_data = bootstrap_vectors;
   }
 
-  auto run_query_phase = [&](size_t ops) {
+  auto run_query_phase = [&](const std::string& label, size_t ops) {
+    std::atomic<size_t> completed_ops{0};
+    ProgressReporter reporter(label, ops, completed_ops);
     for (size_t op = 0; op < ops; ++op) {
       const size_t idx = op % query_count;
       std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(idx * dim),
                                query_data.begin() + static_cast<std::ptrdiff_t>((idx + 1) * dim));
       (void)service.search(query, service.config().k);
+      completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
+    reporter.finish();
   };
 
-  auto run_mixed_phase = [&](size_t ops, uint32_t start_id) {
+  auto run_mixed_phase = [&](const std::string& label, size_t ops, uint32_t start_id) {
     std::atomic<size_t> next_op{0};
+    std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
     std::atomic<size_t> next_query_idx{0};
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
+    ProgressReporter reporter(label, ops, completed_ops);
 
     const size_t read_period = args.read_ratio >= 1.0 ? 1 : (args.read_ratio <= 0.0 ? std::numeric_limits<size_t>::max()
                                                                                     : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
@@ -372,6 +434,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             }
             (void)service.insert(batch);
           }
+          completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
@@ -379,19 +442,20 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     for (auto& thread : threads) {
       thread.join();
     }
+    reporter.finish();
   };
 
   uint32_t next_insert_id = static_cast<uint32_t>(bootstrap_count + 10'000);
 
   if (args.workload == "insert" || args.workload == "both") {
-    run_insert_phase(args.warmup_ops, next_insert_id);
+    run_insert_phase("warmup-insert", args.warmup_ops, next_insert_id);
     next_insert_id += static_cast<uint32_t>(args.warmup_ops * args.batch_size + 1024);
   }
   if (args.workload == "query" || args.workload == "both") {
-    run_query_phase(args.warmup_ops);
+    run_query_phase("warmup-query", args.warmup_ops);
   }
   if (args.workload == "mixed") {
-    run_mixed_phase(args.warmup_ops, next_insert_id);
+    run_mixed_phase("warmup-mixed", args.warmup_ops, next_insert_id);
     next_insert_id += static_cast<uint32_t>(args.warmup_ops * args.batch_size + 1024);
   }
 
@@ -399,13 +463,13 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   service.reset_breakdown_state();
 
   if (args.workload == "insert" || args.workload == "both") {
-    run_insert_phase(args.measure_ops, next_insert_id);
+    run_insert_phase("measure-insert", args.measure_ops, next_insert_id);
   }
   if (args.workload == "query" || args.workload == "both") {
-    run_query_phase(args.measure_ops);
+    run_query_phase("measure-query", args.measure_ops);
   }
   if (args.workload == "mixed") {
-    run_mixed_phase(args.measure_ops, next_insert_id);
+    run_mixed_phase("measure-mixed", args.measure_ops, next_insert_id);
   }
 
   const SampleReport report = service.collect_breakdown_report();
