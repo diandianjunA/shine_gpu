@@ -525,7 +525,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
                                                                                     : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
-      threads.emplace_back([&]() {
+      threads.emplace_back([&, tid]() {
         start_barrier.arrive_and_wait();
         for (;;) {
           const size_t op_index = next_op.fetch_add(1, std::memory_order_relaxed);
@@ -593,7 +593,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
                                                                                     : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
-      threads.emplace_back([&]() {
+      threads.emplace_back([&, tid]() {
         start_barrier.arrive_and_wait();
         size_t local_op_index = tid;
         std::chrono::nanoseconds avg_read_duration{0};
