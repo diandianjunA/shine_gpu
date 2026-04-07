@@ -255,6 +255,35 @@ std::vector<float> read_fbin(const std::string& path, uint32_t* dim_out, size_t*
   return data;
 }
 
+bool can_start_timed_operation(const std::chrono::steady_clock::time_point deadline,
+                               const std::chrono::nanoseconds avg_duration,
+                               size_t completed_ops) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    return false;
+  }
+  if (completed_ops == 0 || avg_duration.count() <= 0) {
+    return true;
+  }
+
+  const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+  return remaining >= avg_duration;
+}
+
+void update_avg_duration(std::chrono::nanoseconds& avg_duration,
+                         const std::chrono::steady_clock::time_point started_at,
+                         size_t completed_ops) {
+  const auto observed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now() - started_at);
+  if (completed_ops == 0 || avg_duration.count() <= 0) {
+    avg_duration = observed;
+    return;
+  }
+
+  avg_duration = std::chrono::nanoseconds(
+    (avg_duration.count() * 7 + observed.count()) / 8);
+}
+
 class ProgressReporter {
 public:
   ProgressReporter(std::string label, const std::atomic<size_t>& completed_ops, size_t total_ops = 0,
@@ -332,6 +361,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"warmup_seconds", args.warmup_seconds},
     {"measure_seconds", args.measure_seconds},
     {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
+    {"time_completion_policy", "drain"},
+    {"time_issue_policy", "bounded_by_observed_call_latency"},
     {"batch_size", args.batch_size},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
@@ -393,7 +424,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     ProgressReporter reporter(label, completed_ops, 0, seconds);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     uint32_t current_id = start_id;
-    while (std::chrono::steady_clock::now() < deadline) {
+    std::chrono::nanoseconds avg_insert_duration{0};
+    size_t local_completed = 0;
+    while (can_start_timed_operation(deadline, avg_insert_duration, local_completed)) {
       vec<typename ComputeService<Distance>::InsertItem> batch;
       batch.reserve(args.batch_size);
       for (size_t i = 0; i < args.batch_size; ++i) {
@@ -401,8 +434,11 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         auto values = make_deterministic_vector(id, dim);
         batch.push_back({id, vec<element_t>(values.begin(), values.end())});
       }
+      const auto started_at = std::chrono::steady_clock::now();
       service.insert(batch);
+      update_avg_duration(avg_insert_duration, started_at, local_completed);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
+      ++local_completed;
     }
     reporter.finish();
     return current_id;
@@ -445,11 +481,14 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     ProgressReporter reporter(label, completed_ops, 0, seconds);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     size_t op = 0;
-    while (std::chrono::steady_clock::now() < deadline) {
+    std::chrono::nanoseconds avg_query_duration{0};
+    while (can_start_timed_operation(deadline, avg_query_duration, op)) {
       const size_t idx = op % query_count;
       std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(idx * dim),
                                query_data.begin() + static_cast<std::ptrdiff_t>((idx + 1) * dim));
+      const auto started_at = std::chrono::steady_clock::now();
       (void)service.search(query, service.config().k);
+      update_avg_duration(avg_query_duration, started_at, op);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
       ++op;
     }
@@ -529,7 +568,11 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       threads.emplace_back([&]() {
         start_barrier.arrive_and_wait();
         size_t local_op_index = tid;
-        while (std::chrono::steady_clock::now() < deadline) {
+        std::chrono::nanoseconds avg_read_duration{0};
+        std::chrono::nanoseconds avg_write_duration{0};
+        size_t local_reads = 0;
+        size_t local_writes = 0;
+        for (;;) {
           bool do_read = true;
           if (args.read_ratio <= 0.0) {
             do_read = false;
@@ -538,10 +581,23 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           }
 
           if (do_read) {
+            if (!can_start_timed_operation(deadline, avg_read_duration, local_reads)) {
+              break;
+            }
+          } else {
+            if (!can_start_timed_operation(deadline, avg_write_duration, local_writes)) {
+              break;
+            }
+          }
+
+          if (do_read) {
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
+            const auto started_at = std::chrono::steady_clock::now();
             (void)service.search(query, service.config().k);
+            update_avg_duration(avg_read_duration, started_at, local_reads);
+            ++local_reads;
           } else {
             vec<typename ComputeService<Distance>::InsertItem> batch;
             batch.reserve(args.batch_size);
@@ -550,7 +606,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
               auto values = make_deterministic_vector(id, dim);
               batch.push_back({id, vec<element_t>(values.begin(), values.end())});
             }
+            const auto started_at = std::chrono::steady_clock::now();
             (void)service.insert(batch);
+            update_avg_duration(avg_write_duration, started_at, local_writes);
+            ++local_writes;
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
           local_op_index += args.client_threads;

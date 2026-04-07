@@ -3,6 +3,8 @@
 # SHINE Breakdown Benchmark Runner
 # =============================================================================
 # 运行 SHINE breakdown benchmark，默认执行 50% 读 / 50% 写的 mixed 场景。
+# 时间模式默认采用 drain 语义：到达截止时间后不再发新请求，并等待已启动请求完成；
+# 同时 benchmark 会根据已观测到的单次调用耗时，避免在窗口尾部再启动明显会拖很久的新调用。
 # 该脚本不会启动 memory node，请先用 start_memory_node.sh 或现有部署方式启动服务端。
 #
 # 用法:
@@ -137,7 +139,7 @@ echo "  负载模式:       $WORKLOAD"
 echo "  读比例:         $READ_RATIO"
 echo "  前台线程数:     $CLIENT_THREADS"
 if [[ -n "$WARMUP_SECONDS" || -n "$MEASURE_SECONDS" ]]; then
-    echo "  运行模式:       time"
+    echo "  运行模式:       time (drain)"
     echo "  预热时长:       ${WARMUP_SECONDS}s"
     echo "  测量时长:       ${MEASURE_SECONDS}s"
 else
