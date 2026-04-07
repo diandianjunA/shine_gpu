@@ -40,6 +40,14 @@ struct Args {
   std::string report_text_path;
 };
 
+struct MixedPhaseStats {
+  uint32_t next_insert_id{};
+  size_t issued_reads{};
+  size_t issued_writes{};
+  size_t completed_reads{};
+  size_t completed_writes{};
+};
+
 std::string trim(std::string value) {
   auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
   value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
@@ -499,11 +507,15 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     reporter.finish();
   };
 
-  auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) {
+  auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) -> MixedPhaseStats {
     std::atomic<size_t> next_op{0};
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
     std::atomic<size_t> next_query_idx{0};
+    std::atomic<size_t> issued_reads{0};
+    std::atomic<size_t> issued_writes{0};
+    std::atomic<size_t> completed_reads{0};
+    std::atomic<size_t> completed_writes{0};
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -529,17 +541,21 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           }
 
           if (do_read) {
+            issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
             (void)service.search(query, service.config().k);
+            completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
+            issued_writes.fetch_add(1, std::memory_order_relaxed);
             const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
             auto values = make_deterministic_vector(id, dim);
             vec<typename ComputeService<Distance>::InsertItem> insert_items;
             insert_items.reserve(1);
             insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
             (void)service.insert(insert_items);
+            completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
@@ -550,13 +566,23 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       thread.join();
     }
     reporter.finish();
-    return next_insert_id.load(std::memory_order_relaxed);
+    return MixedPhaseStats{
+      .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
+      .issued_reads = issued_reads.load(std::memory_order_relaxed),
+      .issued_writes = issued_writes.load(std::memory_order_relaxed),
+      .completed_reads = completed_reads.load(std::memory_order_relaxed),
+      .completed_writes = completed_writes.load(std::memory_order_relaxed),
+    };
   };
 
-  auto run_mixed_phase_seconds = [&](const std::string& label, size_t seconds, uint32_t start_id) -> uint32_t {
+  auto run_mixed_phase_seconds = [&](const std::string& label, size_t seconds, uint32_t start_id) -> MixedPhaseStats {
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
     std::atomic<size_t> next_query_idx{0};
+    std::atomic<size_t> issued_reads{0};
+    std::atomic<size_t> issued_writes{0};
+    std::atomic<size_t> completed_reads{0};
+    std::atomic<size_t> completed_writes{0};
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -593,6 +619,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           }
 
           if (do_read) {
+            issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
@@ -600,7 +627,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             (void)service.search(query, service.config().k);
             update_avg_duration(avg_read_duration, started_at, local_reads);
             ++local_reads;
+            completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
+            issued_writes.fetch_add(1, std::memory_order_relaxed);
             const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
             auto values = make_deterministic_vector(id, dim);
             vec<typename ComputeService<Distance>::InsertItem> insert_items;
@@ -610,6 +639,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             (void)service.insert(insert_items);
             update_avg_duration(avg_write_duration, started_at, local_writes);
             ++local_writes;
+            completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
           local_op_index += args.client_threads;
@@ -621,11 +651,19 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       thread.join();
     }
     reporter.finish();
-    return next_insert_id.load(std::memory_order_relaxed);
+    return MixedPhaseStats{
+      .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
+      .issued_reads = issued_reads.load(std::memory_order_relaxed),
+      .issued_writes = issued_writes.load(std::memory_order_relaxed),
+      .completed_reads = completed_reads.load(std::memory_order_relaxed),
+      .completed_writes = completed_writes.load(std::memory_order_relaxed),
+    };
   };
 
   uint32_t next_insert_id = static_cast<uint32_t>(bootstrap_count + 10'000);
   const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
+  MixedPhaseStats warmup_mixed_stats{};
+  MixedPhaseStats measure_mixed_stats{};
 
   if (args.workload == "insert" || args.workload == "both") {
     if (use_time_mode) {
@@ -644,9 +682,11 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   }
   if (args.workload == "mixed") {
     if (use_time_mode) {
-      next_insert_id = run_mixed_phase_seconds("warmup-mixed", args.warmup_seconds, next_insert_id) + 1024;
+      warmup_mixed_stats = run_mixed_phase_seconds("warmup-mixed", args.warmup_seconds, next_insert_id);
+      next_insert_id = warmup_mixed_stats.next_insert_id + 1024;
     } else {
-      next_insert_id = run_mixed_phase_ops("warmup-mixed", args.warmup_ops, next_insert_id) + 1024;
+      warmup_mixed_stats = run_mixed_phase_ops("warmup-mixed", args.warmup_ops, next_insert_id);
+      next_insert_id = warmup_mixed_stats.next_insert_id + 1024;
     }
   }
 
@@ -669,10 +709,32 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   }
   if (args.workload == "mixed") {
     if (use_time_mode) {
-      next_insert_id = run_mixed_phase_seconds("measure-mixed", args.measure_seconds, next_insert_id);
+      measure_mixed_stats = run_mixed_phase_seconds("measure-mixed", args.measure_seconds, next_insert_id);
+      next_insert_id = measure_mixed_stats.next_insert_id;
     } else {
-      next_insert_id = run_mixed_phase_ops("measure-mixed", args.measure_ops, next_insert_id);
+      measure_mixed_stats = run_mixed_phase_ops("measure-mixed", args.measure_ops, next_insert_id);
+      next_insert_id = measure_mixed_stats.next_insert_id;
     }
+  }
+
+  if (args.workload == "mixed") {
+    root["meta"]["warmup_mixed"] = {
+      {"issued_reads", warmup_mixed_stats.issued_reads},
+      {"issued_writes", warmup_mixed_stats.issued_writes},
+      {"completed_reads", warmup_mixed_stats.completed_reads},
+      {"completed_writes", warmup_mixed_stats.completed_writes},
+    };
+    root["meta"]["measure_mixed"] = {
+      {"issued_reads", measure_mixed_stats.issued_reads},
+      {"issued_writes", measure_mixed_stats.issued_writes},
+      {"completed_reads", measure_mixed_stats.completed_reads},
+      {"completed_writes", measure_mixed_stats.completed_writes},
+    };
+    std::cerr << "[breakdown][measure-mixed] reads issued/completed=" << measure_mixed_stats.issued_reads << "/"
+              << measure_mixed_stats.completed_reads << ", writes issued/completed="
+              << measure_mixed_stats.issued_writes << "/" << measure_mixed_stats.completed_writes << std::endl;
+    lib_assert(measure_mixed_stats.completed_reads > 0, "mixed benchmark completed zero reads");
+    lib_assert(measure_mixed_stats.completed_writes > 0, "mixed benchmark completed zero writes");
   }
 
   const SampleReport report = service.collect_breakdown_report();
