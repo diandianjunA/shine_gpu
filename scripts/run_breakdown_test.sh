@@ -13,8 +13,10 @@
 #   -w, --workload <mode>         负载模式: mixed/query/insert/both（默认: mixed）
 #       --read-ratio <ratio>      mixed 模式下读比例（默认: 0.5）
 #       --client-threads <n>      前台压测线程数（默认: 4）
-#       --warmup-ops <n>          预热请求数（默认: 200）
-#       --measure-ops <n>         正式测量请求数（默认: 2000）
+#       --warmup-seconds <n>      预热时长（秒，默认: 30）
+#       --measure-seconds <n>     正式测量时长（秒，默认: 60）
+#       --warmup-ops <n>          预热请求数（兼容旧模式）
+#       --measure-ops <n>         正式测量请求数（兼容旧模式）
 #   -b, --batch-size <n>          单次 insert 的 batch 大小（默认: 1）
 #       --query-file <path>       外部 query 文件（.fbin），不提供则使用 synthetic query
 #       --report-dir <path>       报告输出目录（默认: ./reports/breakdown）
@@ -22,12 +24,13 @@
 #   -h, --help                    显示帮助信息
 #
 # 环境变量:
-#   SERVICE_CONFIG, WORKLOAD, READ_RATIO, CLIENT_THREADS, WARMUP_OPS,
-#   MEASURE_OPS, BATCH_SIZE, QUERY_FILE, REPORT_DIR, LABEL
+#   SERVICE_CONFIG, WORKLOAD, READ_RATIO, CLIENT_THREADS, WARMUP_SECONDS,
+#   MEASURE_SECONDS, WARMUP_OPS, MEASURE_OPS, BATCH_SIZE, QUERY_FILE,
+#   REPORT_DIR, LABEL
 #
 # 示例:
 #   ./run_breakdown_test.sh
-#   ./run_breakdown_test.sh --client-threads 8 --measure-ops 5000
+#   ./run_breakdown_test.sh --client-threads 8 --measure-seconds 120
 #   ./run_breakdown_test.sh --workload query --query-file /data/queries.fbin
 # =============================================================================
 
@@ -41,8 +44,10 @@ SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/local_same_host_5mn.i
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
 CLIENT_THREADS="${CLIENT_THREADS:-4}"
-WARMUP_OPS="${WARMUP_OPS:-200}"
-MEASURE_OPS="${MEASURE_OPS:-2000}"
+WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
+MEASURE_SECONDS="${MEASURE_SECONDS:-60}"
+WARMUP_OPS="${WARMUP_OPS:-}"
+MEASURE_OPS="${MEASURE_OPS:-}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 QUERY_FILE="${QUERY_FILE:-}"
 REPORT_DIR="${REPORT_DIR:-$PROJECT_DIR/reports/breakdown}"
@@ -59,6 +64,8 @@ while [[ $# -gt 0 ]]; do
         -w|--workload)       WORKLOAD="$2"; shift 2 ;;
         --read-ratio)        READ_RATIO="$2"; shift 2 ;;
         --client-threads)    CLIENT_THREADS="$2"; shift 2 ;;
+        --warmup-seconds)    WARMUP_SECONDS="$2"; shift 2 ;;
+        --measure-seconds)   MEASURE_SECONDS="$2"; shift 2 ;;
         --warmup-ops)        WARMUP_OPS="$2"; shift 2 ;;
         --measure-ops)       MEASURE_OPS="$2"; shift 2 ;;
         -b|--batch-size)     BATCH_SIZE="$2"; shift 2 ;;
@@ -101,12 +108,24 @@ ARGS=(
     --workload "$WORKLOAD"
     --read-ratio "$READ_RATIO"
     --client-threads "$CLIENT_THREADS"
-    --warmup-ops "$WARMUP_OPS"
-    --measure-ops "$MEASURE_OPS"
     --batch-size "$BATCH_SIZE"
     --report-json "$JSON_REPORT"
     --report-text "$TEXT_REPORT"
 )
+
+if [[ -n "$WARMUP_SECONDS" || -n "$MEASURE_SECONDS" ]]; then
+    if [[ -z "$WARMUP_SECONDS" || -z "$MEASURE_SECONDS" ]]; then
+        echo "错误: 使用时间模式时，WARMUP_SECONDS 和 MEASURE_SECONDS 都必须设置"
+        exit 1
+    fi
+    ARGS+=(--warmup-seconds "$WARMUP_SECONDS" --measure-seconds "$MEASURE_SECONDS")
+else
+    if [[ -z "$WARMUP_OPS" || -z "$MEASURE_OPS" ]]; then
+        echo "错误: 使用 ops 模式时，WARMUP_OPS 和 MEASURE_OPS 都必须设置"
+        exit 1
+    fi
+    ARGS+=(--warmup-ops "$WARMUP_OPS" --measure-ops "$MEASURE_OPS")
+fi
 
 if [[ -n "$QUERY_FILE" ]]; then
     ARGS+=(--query-file "$QUERY_FILE")
@@ -117,8 +136,15 @@ echo "  配置文件:       $SERVICE_CONFIG"
 echo "  负载模式:       $WORKLOAD"
 echo "  读比例:         $READ_RATIO"
 echo "  前台线程数:     $CLIENT_THREADS"
-echo "  预热请求数:     $WARMUP_OPS"
-echo "  测量请求数:     $MEASURE_OPS"
+if [[ -n "$WARMUP_SECONDS" || -n "$MEASURE_SECONDS" ]]; then
+    echo "  运行模式:       time"
+    echo "  预热时长:       ${WARMUP_SECONDS}s"
+    echo "  测量时长:       ${MEASURE_SECONDS}s"
+else
+    echo "  运行模式:       ops"
+    echo "  预热请求数:     $WARMUP_OPS"
+    echo "  测量请求数:     $MEASURE_OPS"
+fi
 echo "  Insert batch:   $BATCH_SIZE"
 if [[ -n "$QUERY_FILE" ]]; then
     echo "  Query 文件:     $QUERY_FILE"

@@ -28,6 +28,8 @@ struct Args {
   std::string workload{"both"};
   size_t warmup_ops{100};
   size_t measure_ops{1000};
+  size_t warmup_seconds{0};
+  size_t measure_seconds{0};
   size_t batch_size{1};
   size_t client_threads{4};
   double read_ratio{0.5};
@@ -154,6 +156,10 @@ Args parse_args(int argc, char** argv) {
       args.warmup_ops = std::stoull(require_value("--warmup-ops"));
     } else if (flag == "--measure-ops") {
       args.measure_ops = std::stoull(require_value("--measure-ops"));
+    } else if (flag == "--warmup-seconds") {
+      args.warmup_seconds = std::stoull(require_value("--warmup-seconds"));
+    } else if (flag == "--measure-seconds") {
+      args.measure_seconds = std::stoull(require_value("--measure-seconds"));
     } else if (flag == "--batch-size") {
       args.batch_size = std::stoull(require_value("--batch-size"));
     } else if (flag == "--client-threads") {
@@ -190,6 +196,10 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.read_ratio < 0.0 || args.read_ratio > 1.0) {
     throw std::runtime_error("--read-ratio must be in [0, 1]");
+  }
+  const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
+  if (use_time_mode && (args.warmup_seconds == 0 || args.measure_seconds == 0)) {
+    throw std::runtime_error("--warmup-seconds and --measure-seconds must both be > 0 when using time-based mode");
   }
   return args;
 }
@@ -247,8 +257,9 @@ std::vector<float> read_fbin(const std::string& path, uint32_t* dim_out, size_t*
 
 class ProgressReporter {
 public:
-  ProgressReporter(std::string label, size_t total_ops, const std::atomic<size_t>& completed_ops)
-      : label_(std::move(label)), total_ops_(std::max<size_t>(total_ops, 1)), completed_ops_(completed_ops),
+  ProgressReporter(std::string label, const std::atomic<size_t>& completed_ops, size_t total_ops = 0,
+                   size_t total_seconds = 0)
+      : label_(std::move(label)), total_ops_(total_ops), total_seconds_(total_seconds), completed_ops_(completed_ops),
         start_(std::chrono::steady_clock::now()),
         thread_([this]() { run(); }) {}
 
@@ -269,9 +280,14 @@ private:
       const size_t completed = completed_ops_.load(std::memory_order_relaxed);
       const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
       const double rate = elapsed <= 0.0 ? 0.0 : static_cast<double>(completed) / elapsed;
-      std::cerr << "[breakdown][" << label_ << "] progress " << completed << "/" << total_ops_
-                << " ops, rate=" << rate << " ops/s" << std::endl;
-      if (completed >= total_ops_) {
+      if (total_seconds_ > 0) {
+        std::cerr << "[breakdown][" << label_ << "] progress elapsed=" << elapsed << "s/" << total_seconds_
+                  << "s, completed=" << completed << " ops, rate=" << rate << " ops/s" << std::endl;
+      } else {
+        std::cerr << "[breakdown][" << label_ << "] progress " << completed << "/" << std::max<size_t>(total_ops_, 1)
+                  << " ops, rate=" << rate << " ops/s" << std::endl;
+      }
+      if (total_seconds_ == 0 && completed >= total_ops_) {
         break;
       }
       if (completed == last_completed && completed > 0) {
@@ -284,12 +300,18 @@ private:
     const size_t completed = completed_ops_.load(std::memory_order_relaxed);
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
     const double rate = elapsed <= 0.0 ? 0.0 : static_cast<double>(completed) / elapsed;
-    std::cerr << "[breakdown][" << label_ << "] done " << completed << "/" << total_ops_
-              << " ops, avg_rate=" << rate << " ops/s" << std::endl;
+    if (total_seconds_ > 0) {
+      std::cerr << "[breakdown][" << label_ << "] done elapsed=" << elapsed << "s/" << total_seconds_
+                << "s, completed=" << completed << " ops, avg_rate=" << rate << " ops/s" << std::endl;
+    } else {
+      std::cerr << "[breakdown][" << label_ << "] done " << completed << "/" << std::max<size_t>(total_ops_, 1)
+                << " ops, avg_rate=" << rate << " ops/s" << std::endl;
+    }
   }
 
   std::string label_;
   size_t total_ops_;
+  size_t total_seconds_;
   const std::atomic<size_t>& completed_ops_;
   std::chrono::steady_clock::time_point start_;
   std::atomic<bool> finished_{false};
@@ -307,6 +329,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"workload", args.workload},
     {"warmup_ops", args.warmup_ops},
     {"measure_ops", args.measure_ops},
+    {"warmup_seconds", args.warmup_seconds},
+    {"measure_seconds", args.measure_seconds},
+    {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
     {"batch_size", args.batch_size},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
@@ -317,7 +342,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   };
 
   const size_t dim = service.config().dim;
-  const size_t bootstrap_count = std::max<size_t>(2048, args.measure_ops * std::max<size_t>(1, args.batch_size));
+  const size_t bootstrap_work = args.measure_seconds > 0
+                                  ? std::max<size_t>(4096, args.client_threads * args.batch_size * 256)
+                                  : std::max<size_t>(2048, args.measure_ops * std::max<size_t>(1, args.batch_size));
+  const size_t bootstrap_count = bootstrap_work;
   const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
   const bool requires_rabitq_artifacts = service.config().use_rabitq_search() &&
                                          (args.workload == "insert" || args.workload == "both" || args.workload == "mixed");
@@ -343,9 +371,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     root["meta"]["bootstrap_vectors"] = bootstrap_count;
   }
 
-  auto run_insert_phase = [&](const std::string& label, size_t ops, uint32_t start_id) {
+  auto run_insert_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) {
     std::atomic<size_t> completed_ops{0};
-    ProgressReporter reporter(label, ops, completed_ops);
+    ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
       vec<typename ComputeService<Distance>::InsertItem> batch;
       batch.reserve(args.batch_size);
@@ -358,6 +386,26 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
     reporter.finish();
+  };
+
+  auto run_insert_phase_seconds = [&](const std::string& label, size_t seconds, uint32_t start_id) -> uint32_t {
+    std::atomic<size_t> completed_ops{0};
+    ProgressReporter reporter(label, completed_ops, 0, seconds);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    uint32_t current_id = start_id;
+    while (std::chrono::steady_clock::now() < deadline) {
+      vec<typename ComputeService<Distance>::InsertItem> batch;
+      batch.reserve(args.batch_size);
+      for (size_t i = 0; i < args.batch_size; ++i) {
+        const uint32_t id = current_id++;
+        auto values = make_deterministic_vector(id, dim);
+        batch.push_back({id, vec<element_t>(values.begin(), values.end())});
+      }
+      service.insert(batch);
+      completed_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+    reporter.finish();
+    return current_id;
   };
 
   std::vector<float> query_data;
@@ -373,13 +421,15 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       throw std::runtime_error("query dim mismatch with service config");
     }
   } else {
-    query_count = std::max<size_t>(bootstrap_count, args.measure_ops * args.client_threads);
+    query_count = std::max<size_t>(
+      bootstrap_count,
+      args.measure_seconds > 0 ? args.client_threads * 4096 : args.measure_ops * args.client_threads);
     query_data = bootstrap_vectors;
   }
 
-  auto run_query_phase = [&](const std::string& label, size_t ops) {
+  auto run_query_phase_ops = [&](const std::string& label, size_t ops) {
     std::atomic<size_t> completed_ops{0};
-    ProgressReporter reporter(label, ops, completed_ops);
+    ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
       const size_t idx = op % query_count;
       std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(idx * dim),
@@ -390,7 +440,23 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     reporter.finish();
   };
 
-  auto run_mixed_phase = [&](const std::string& label, size_t ops, uint32_t start_id) {
+  auto run_query_phase_seconds = [&](const std::string& label, size_t seconds) {
+    std::atomic<size_t> completed_ops{0};
+    ProgressReporter reporter(label, completed_ops, 0, seconds);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    size_t op = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const size_t idx = op % query_count;
+      std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(idx * dim),
+                               query_data.begin() + static_cast<std::ptrdiff_t>((idx + 1) * dim));
+      (void)service.search(query, service.config().k);
+      completed_ops.fetch_add(1, std::memory_order_relaxed);
+      ++op;
+    }
+    reporter.finish();
+  };
+
+  auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) {
     std::atomic<size_t> next_op{0};
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
@@ -398,7 +464,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
-    ProgressReporter reporter(label, ops, completed_ops);
+    ProgressReporter reporter(label, completed_ops, ops, 0);
 
     const size_t read_period = args.read_ratio >= 1.0 ? 1 : (args.read_ratio <= 0.0 ? std::numeric_limits<size_t>::max()
                                                                                     : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
@@ -443,33 +509,111 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       thread.join();
     }
     reporter.finish();
+    return next_insert_id.load(std::memory_order_relaxed);
+  };
+
+  auto run_mixed_phase_seconds = [&](const std::string& label, size_t seconds, uint32_t start_id) -> uint32_t {
+    std::atomic<size_t> completed_ops{0};
+    std::atomic<uint32_t> next_insert_id{start_id};
+    std::atomic<size_t> next_query_idx{0};
+    std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
+    std::vector<std::thread> threads;
+    threads.reserve(args.client_threads);
+    ProgressReporter reporter(label, completed_ops, 0, seconds);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+
+    const size_t read_period = args.read_ratio >= 1.0 ? 1 : (args.read_ratio <= 0.0 ? std::numeric_limits<size_t>::max()
+                                                                                    : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
+
+    for (size_t tid = 0; tid < args.client_threads; ++tid) {
+      threads.emplace_back([&]() {
+        start_barrier.arrive_and_wait();
+        size_t local_op_index = tid;
+        while (std::chrono::steady_clock::now() < deadline) {
+          bool do_read = true;
+          if (args.read_ratio <= 0.0) {
+            do_read = false;
+          } else if (args.read_ratio < 1.0) {
+            do_read = ((local_op_index + 1) % read_period) != 0;
+          }
+
+          if (do_read) {
+            const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
+            std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
+                                     query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
+            (void)service.search(query, service.config().k);
+          } else {
+            vec<typename ComputeService<Distance>::InsertItem> batch;
+            batch.reserve(args.batch_size);
+            for (size_t i = 0; i < args.batch_size; ++i) {
+              const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
+              auto values = make_deterministic_vector(id, dim);
+              batch.push_back({id, vec<element_t>(values.begin(), values.end())});
+            }
+            (void)service.insert(batch);
+          }
+          completed_ops.fetch_add(1, std::memory_order_relaxed);
+          local_op_index += args.client_threads;
+        }
+      });
+    }
+
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    reporter.finish();
+    return next_insert_id.load(std::memory_order_relaxed);
   };
 
   uint32_t next_insert_id = static_cast<uint32_t>(bootstrap_count + 10'000);
+  const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
 
   if (args.workload == "insert" || args.workload == "both") {
-    run_insert_phase("warmup-insert", args.warmup_ops, next_insert_id);
-    next_insert_id += static_cast<uint32_t>(args.warmup_ops * args.batch_size + 1024);
+    if (use_time_mode) {
+      next_insert_id = run_insert_phase_seconds("warmup-insert", args.warmup_seconds, next_insert_id) + 1024;
+    } else {
+      run_insert_phase_ops("warmup-insert", args.warmup_ops, next_insert_id);
+      next_insert_id += static_cast<uint32_t>(args.warmup_ops * args.batch_size + 1024);
+    }
   }
   if (args.workload == "query" || args.workload == "both") {
-    run_query_phase("warmup-query", args.warmup_ops);
+    if (use_time_mode) {
+      run_query_phase_seconds("warmup-query", args.warmup_seconds);
+    } else {
+      run_query_phase_ops("warmup-query", args.warmup_ops);
+    }
   }
   if (args.workload == "mixed") {
-    run_mixed_phase("warmup-mixed", args.warmup_ops, next_insert_id);
-    next_insert_id += static_cast<uint32_t>(args.warmup_ops * args.batch_size + 1024);
+    if (use_time_mode) {
+      next_insert_id = run_mixed_phase_seconds("warmup-mixed", args.warmup_seconds, next_insert_id) + 1024;
+    } else {
+      next_insert_id = run_mixed_phase_ops("warmup-mixed", args.warmup_ops, next_insert_id) + 1024;
+    }
   }
 
   service.clear_thread_statistics();
   service.reset_breakdown_state();
 
   if (args.workload == "insert" || args.workload == "both") {
-    run_insert_phase("measure-insert", args.measure_ops, next_insert_id);
+    if (use_time_mode) {
+      next_insert_id = run_insert_phase_seconds("measure-insert", args.measure_seconds, next_insert_id);
+    } else {
+      run_insert_phase_ops("measure-insert", args.measure_ops, next_insert_id);
+    }
   }
   if (args.workload == "query" || args.workload == "both") {
-    run_query_phase("measure-query", args.measure_ops);
+    if (use_time_mode) {
+      run_query_phase_seconds("measure-query", args.measure_seconds);
+    } else {
+      run_query_phase_ops("measure-query", args.measure_ops);
+    }
   }
   if (args.workload == "mixed") {
-    run_mixed_phase("measure-mixed", args.measure_ops, next_insert_id);
+    if (use_time_mode) {
+      next_insert_id = run_mixed_phase_seconds("measure-mixed", args.measure_seconds, next_insert_id);
+    } else {
+      next_insert_id = run_mixed_phase_ops("measure-mixed", args.measure_ops, next_insert_id);
+    }
   }
 
   const SampleReport report = service.collect_breakdown_report();
