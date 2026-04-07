@@ -371,6 +371,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"coroutines", service.config().num_coroutines},
     {"search_mode", service.config().search_mode},
   };
+  if (args.workload == "mixed") {
+    root["meta"]["mixed_insert_granularity"] = "single_vector";
+    root["meta"]["mixed_insert_batch_size"] = 1;
+  }
 
   const size_t dim = service.config().dim;
   const size_t bootstrap_work = args.measure_seconds > 0
@@ -530,14 +534,12 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
             (void)service.search(query, service.config().k);
           } else {
-            vec<typename ComputeService<Distance>::InsertItem> batch;
-            batch.reserve(args.batch_size);
-            for (size_t i = 0; i < args.batch_size; ++i) {
-              const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
-              auto values = make_deterministic_vector(id, dim);
-              batch.push_back({id, vec<element_t>(values.begin(), values.end())});
-            }
-            (void)service.insert(batch);
+            const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
+            auto values = make_deterministic_vector(id, dim);
+            vec<typename ComputeService<Distance>::InsertItem> insert_items;
+            insert_items.reserve(1);
+            insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
+            (void)service.insert(insert_items);
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
@@ -599,15 +601,13 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             update_avg_duration(avg_read_duration, started_at, local_reads);
             ++local_reads;
           } else {
-            vec<typename ComputeService<Distance>::InsertItem> batch;
-            batch.reserve(args.batch_size);
-            for (size_t i = 0; i < args.batch_size; ++i) {
-              const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
-              auto values = make_deterministic_vector(id, dim);
-              batch.push_back({id, vec<element_t>(values.begin(), values.end())});
-            }
+            const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
+            auto values = make_deterministic_vector(id, dim);
+            vec<typename ComputeService<Distance>::InsertItem> insert_items;
+            insert_items.reserve(1);
+            insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
             const auto started_at = std::chrono::steady_clock::now();
-            (void)service.insert(batch);
+            (void)service.insert(insert_items);
             update_avg_duration(avg_write_duration, started_at, local_writes);
             ++local_writes;
           }
