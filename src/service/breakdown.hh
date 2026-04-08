@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
-#include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -22,60 +21,22 @@ using Nanoseconds = std::chrono::nanoseconds;
 
 enum class Operation : u8 { query = 0, insert = 1 };
 
-enum class Phase : u8 {
-  query_medoid_fetch = 0,
-  query_neighbor_fetch,
-  query_vector_fetch,
-  query_rabitq_fetch,
-  query_gpu_prepare,
-  query_gpu_distance,
-  query_gpu_rerank,
-  query_cpu_merge_sort,
-  query_result_materialize,
-  insert_medoid_fetch,
-  insert_candidate_search,
-  insert_candidate_vector_fetch,
-  insert_gpu_distance,
-  insert_gpu_prune,
-  insert_quantize,
-  insert_remote_alloc,
-  insert_new_node_write,
-  insert_neighbor_update,
-  insert_medoid_update,
+enum class Category : u8 {
+  rdma_network = 0,
+  gpu_compute,
+  cpu_gpu_transfer,
+  cache_lookup,
   count
 };
 
-constexpr size_t kPhaseCount = static_cast<size_t>(Phase::count);
+constexpr size_t kCategoryCount = static_cast<size_t>(Category::count);
 
-inline constexpr std::array<std::string_view, kPhaseCount> kPhaseNames = {
-  "medoid_fetch_ns",
-  "neighbor_fetch_ns",
-  "vector_fetch_ns",
-  "rabitq_fetch_ns",
-  "gpu_prepare_ns",
-  "gpu_distance_ns",
-  "gpu_rerank_ns",
-  "cpu_merge_sort_ns",
-  "result_materialize_ns",
-  "medoid_fetch_ns",
-  "candidate_search_ns",
-  "candidate_vector_fetch_ns",
-  "gpu_distance_ns",
-  "gpu_prune_ns",
-  "quantize_ns",
-  "remote_alloc_ns",
-  "new_node_write_ns",
-  "neighbor_update_ns",
-  "medoid_update_ns",
+inline constexpr std::array<std::string_view, kCategoryCount> kCategoryNames = {
+  "rdma_network_ns",
+  "gpu_compute_ns",
+  "cpu_gpu_transfer_ns",
+  "cache_lookup_ns",
 };
-
-inline constexpr bool phase_matches_operation(const Phase phase, const Operation operation) {
-  const size_t idx = static_cast<size_t>(phase);
-  if (operation == Operation::query) {
-    return idx <= static_cast<size_t>(Phase::query_result_materialize);
-  }
-  return idx >= static_cast<size_t>(Phase::insert_medoid_fetch);
-}
 
 inline constexpr std::string_view operation_name(const Operation operation) {
   return operation == Operation::query ? "query" : "insert";
@@ -135,6 +96,8 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
   out.prune_kernels = end.build_prune_kernels - start.build_prune_kernels;
   out.remote_allocations = end.remote_allocations - start.remote_allocations;
   out.overflow_prunes = end.build_overflow_prunes - start.build_overflow_prunes;
+  out.cache_hits = end.cache_hits - start.cache_hits;
+  out.cache_misses = end.cache_misses - start.cache_misses;
   return out;
 }
 
@@ -146,7 +109,7 @@ struct Sample {
   Clock::time_point dequeued_at{};
   Clock::time_point started_at{};
   Clock::time_point finished_at{};
-  std::array<u64, kPhaseCount> phase_ns{};
+  std::array<u64, kCategoryCount> category_ns{};
   statistics::ThreadStatistics start_counters{};
   statistics::ThreadStatistics end_counters{};
   u64 queue_wait_ns{};
@@ -177,7 +140,7 @@ struct Sample {
     end_to_end_ns = static_cast<u64>(std::chrono::duration_cast<Nanoseconds>(finished_at - enqueued_at).count());
   }
 
-  void add_phase(const Phase phase, const u64 ns) { phase_ns[static_cast<size_t>(phase)] += ns; }
+  void add_category(const Category category, const u64 ns) { category_ns[static_cast<size_t>(category)] += ns; }
 
   ThreadCounterDelta counters() const { return diff_thread_counters(end_counters, start_counters, operation); }
 };
@@ -190,25 +153,23 @@ struct Aggregate {
   u64 total_end_to_end_ns{};
   std::vector<u64> end_to_end_latencies_ns{};
   std::vector<u64> service_latencies_ns{};
-  std::array<u64, kPhaseCount> phase_ns{};
+  std::array<u64, kCategoryCount> category_ns{};
   ThreadCounterDelta counters{};
   u64 lock_attempts{};
   u64 lock_retries{};
   u64 cas_failures{};
 
-  [[nodiscard]] u64 phase_sum() const {
+  [[nodiscard]] u64 measured_category_sum() const {
     u64 total = 0;
-    for (size_t i = 0; i < phase_ns.size(); ++i) {
-      if (phase_matches_operation(static_cast<Phase>(i), operation)) {
-        total += phase_ns[i];
-      }
+    for (const u64 value : category_ns) {
+      total += value;
     }
     return total;
   }
 
-  [[nodiscard]] u64 unattributed_ns() const {
-    const u64 total = phase_sum();
-    return total_service_ns > total ? total_service_ns - total : 0;
+  [[nodiscard]] u64 cpu_traversal_ns() const {
+    const u64 measured = measured_category_sum();
+    return total_service_ns > measured ? total_service_ns - measured : 0;
   }
 };
 
@@ -232,8 +193,8 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.total_end_to_end_ns += sample.end_to_end_ns;
   aggregate.end_to_end_latencies_ns.push_back(sample.end_to_end_ns);
   aggregate.service_latencies_ns.push_back(sample.service_ns);
-  for (size_t i = 0; i < aggregate.phase_ns.size(); ++i) {
-    aggregate.phase_ns[i] += sample.phase_ns[i];
+  for (size_t i = 0; i < aggregate.category_ns.size(); ++i) {
+    aggregate.category_ns[i] += sample.category_ns[i];
   }
 
   const ThreadCounterDelta delta = sample.counters();
@@ -290,15 +251,12 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"p99_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.99)},
   };
 
-  json phases = json::object();
-  for (size_t i = 0; i < aggregate.phase_ns.size(); ++i) {
-    const auto phase = static_cast<Phase>(i);
-    if (phase_matches_operation(phase, aggregate.operation)) {
-      phases[std::string{kPhaseNames[i]}] = aggregate.phase_ns[i];
-    }
+  json categories = json::object();
+  for (size_t i = 0; i < aggregate.category_ns.size(); ++i) {
+    categories[std::string{kCategoryNames[i]}] = aggregate.category_ns[i];
   }
-  phases["unattributed_ns"] = aggregate.unattributed_ns();
-  out["phases"] = std::move(phases);
+  categories["cpu_traversal_ns"] = aggregate.cpu_traversal_ns();
+  out["breakdown"] = std::move(categories);
 
   out["counters"] = {
     {"rdma_read_bytes", aggregate.counters.rdma_read_bytes},
@@ -335,18 +293,15 @@ inline std::string aggregate_text_summary(const Aggregate& aggregate) {
      << " p99=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.99)) << '\n';
 
   std::vector<std::pair<std::string, u64>> ranked;
-  ranked.reserve(kPhaseCount + 1);
-  for (size_t i = 0; i < aggregate.phase_ns.size(); ++i) {
-    const auto phase = static_cast<Phase>(i);
-    if (phase_matches_operation(phase, aggregate.operation)) {
-      ranked.emplace_back(std::string{kPhaseNames[i]}, aggregate.phase_ns[i]);
-    }
+  ranked.reserve(kCategoryCount + 1);
+  for (size_t i = 0; i < aggregate.category_ns.size(); ++i) {
+    ranked.emplace_back(std::string{kCategoryNames[i]}, aggregate.category_ns[i]);
   }
-  ranked.emplace_back("unattributed_ns", aggregate.unattributed_ns());
+  ranked.emplace_back("cpu_traversal_ns", aggregate.cpu_traversal_ns());
   std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
 
-  os << "  top_phases:\n";
-  const size_t top = std::min<size_t>(3, ranked.size());
+  os << "  top_categories:\n";
+  const size_t top = std::min<size_t>(4, ranked.size());
   for (size_t i = 0; i < top; ++i) {
     const double ratio = aggregate.total_service_ns == 0
                            ? 0.0
