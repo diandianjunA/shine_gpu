@@ -19,7 +19,6 @@
 #       --measure-seconds <n>     正式测量时长（秒，默认: 60）
 #       --warmup-ops <n>          预热请求数（兼容旧模式）
 #       --measure-ops <n>         正式测量请求数（兼容旧模式）
-#   -b, --batch-size <n>          单次 insert 的 batch 大小（默认: 1）
 #       --query-file <path>       外部 query 文件（.fbin），不提供则使用 synthetic query
 #       --report-dir <path>       报告输出目录（默认: ./reports/breakdown）
 #       --label <name>            报告文件名前缀（默认: 时间戳）
@@ -27,7 +26,7 @@
 #
 # 环境变量:
 #   SERVICE_CONFIG, WORKLOAD, READ_RATIO, CLIENT_THREADS, WARMUP_SECONDS,
-#   MEASURE_SECONDS, WARMUP_OPS, MEASURE_OPS, BATCH_SIZE, QUERY_FILE,
+#   MEASURE_SECONDS, WARMUP_OPS, MEASURE_OPS, QUERY_FILE,
 #   REPORT_DIR, LABEL
 #
 # 示例:
@@ -50,7 +49,6 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-60}"
 WARMUP_OPS="${WARMUP_OPS:-}"
 MEASURE_OPS="${MEASURE_OPS:-}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
 QUERY_FILE="${QUERY_FILE:-}"
 REPORT_DIR="${REPORT_DIR:-$PROJECT_DIR/reports/breakdown}"
 LABEL="${LABEL:-$(date +%Y%m%d_%H%M%S)}"
@@ -70,7 +68,6 @@ while [[ $# -gt 0 ]]; do
         --measure-seconds)   MEASURE_SECONDS="$2"; shift 2 ;;
         --warmup-ops)        WARMUP_OPS="$2"; shift 2 ;;
         --measure-ops)       MEASURE_OPS="$2"; shift 2 ;;
-        -b|--batch-size)     BATCH_SIZE="$2"; shift 2 ;;
         --query-file)        QUERY_FILE="$2"; shift 2 ;;
         --report-dir)        REPORT_DIR="$2"; shift 2 ;;
         --label)             LABEL="$2"; shift 2 ;;
@@ -110,7 +107,6 @@ ARGS=(
     --workload "$WORKLOAD"
     --read-ratio "$READ_RATIO"
     --client-threads "$CLIENT_THREADS"
-    --batch-size "$BATCH_SIZE"
     --report-json "$JSON_REPORT"
     --report-text "$TEXT_REPORT"
 )
@@ -147,7 +143,7 @@ else
     echo "  预热请求数:     $WARMUP_OPS"
     echo "  测量请求数:     $MEASURE_OPS"
 fi
-echo "  Insert batch:   $BATCH_SIZE"
+echo "  操作粒度:       single_vector"
 if [[ -n "$QUERY_FILE" ]]; then
     echo "  Query 文件:     $QUERY_FILE"
 else

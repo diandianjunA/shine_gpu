@@ -30,7 +30,6 @@ struct Args {
   size_t measure_ops{1000};
   size_t warmup_seconds{0};
   size_t measure_seconds{0};
-  size_t batch_size{1};
   size_t client_threads{4};
   double read_ratio{0.5};
   std::string query_file;
@@ -168,8 +167,6 @@ Args parse_args(int argc, char** argv) {
       args.warmup_seconds = std::stoull(require_value("--warmup-seconds"));
     } else if (flag == "--measure-seconds") {
       args.measure_seconds = std::stoull(require_value("--measure-seconds"));
-    } else if (flag == "--batch-size") {
-      args.batch_size = std::stoull(require_value("--batch-size"));
     } else if (flag == "--client-threads") {
       args.client_threads = std::stoull(require_value("--client-threads"));
     } else if (flag == "--read-ratio") {
@@ -371,7 +368,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
     {"time_completion_policy", "drain"},
     {"time_issue_policy", "bounded_by_observed_call_latency"},
-    {"batch_size", args.batch_size},
+    {"operation_granularity", "single_vector"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
     {"dim", service.config().dim},
@@ -379,15 +376,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"coroutines", service.config().num_coroutines},
     {"search_mode", service.config().search_mode},
   };
-  if (args.workload == "mixed") {
-    root["meta"]["mixed_insert_granularity"] = "single_vector";
-    root["meta"]["mixed_insert_batch_size"] = 1;
-  }
-
   const size_t dim = service.config().dim;
   const size_t bootstrap_work = args.measure_seconds > 0
-                                  ? std::max<size_t>(4096, args.client_threads * args.batch_size * 256)
-                                  : std::max<size_t>(2048, args.measure_ops * std::max<size_t>(1, args.batch_size));
+                                  ? std::max<size_t>(4096, args.client_threads * 256)
+                                  : std::max<size_t>(2048, args.measure_ops);
   const size_t bootstrap_count = bootstrap_work;
   const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
   const bool requires_rabitq_artifacts = service.config().use_rabitq_search() &&
@@ -418,14 +410,12 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> completed_ops{0};
     ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
-      vec<typename ComputeService<Distance>::InsertItem> batch;
-      batch.reserve(args.batch_size);
-      for (size_t i = 0; i < args.batch_size; ++i) {
-        const uint32_t id = start_id + static_cast<uint32_t>(op * args.batch_size + i);
-        auto values = make_deterministic_vector(id, dim);
-        batch.push_back({id, vec<element_t>(values.begin(), values.end())});
-      }
-      service.insert(batch);
+      const uint32_t id = start_id + static_cast<uint32_t>(op);
+      auto values = make_deterministic_vector(id, dim);
+      vec<typename ComputeService<Distance>::InsertItem> insert_items;
+      insert_items.reserve(1);
+      insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
+      service.insert(insert_items);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
     reporter.finish();
@@ -439,15 +429,13 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::chrono::nanoseconds avg_insert_duration{0};
     size_t local_completed = 0;
     while (can_start_timed_operation(deadline, avg_insert_duration, local_completed)) {
-      vec<typename ComputeService<Distance>::InsertItem> batch;
-      batch.reserve(args.batch_size);
-      for (size_t i = 0; i < args.batch_size; ++i) {
-        const uint32_t id = current_id++;
-        auto values = make_deterministic_vector(id, dim);
-        batch.push_back({id, vec<element_t>(values.begin(), values.end())});
-      }
+      const uint32_t id = current_id++;
+      auto values = make_deterministic_vector(id, dim);
+      vec<typename ComputeService<Distance>::InsertItem> insert_items;
+      insert_items.reserve(1);
+      insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
       const auto started_at = std::chrono::steady_clock::now();
-      service.insert(batch);
+      service.insert(insert_items);
       update_avg_duration(avg_insert_duration, started_at, local_completed);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
       ++local_completed;
@@ -670,7 +658,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       next_insert_id = run_insert_phase_seconds("warmup-insert", args.warmup_seconds, next_insert_id) + 1024;
     } else {
       run_insert_phase_ops("warmup-insert", args.warmup_ops, next_insert_id);
-      next_insert_id += static_cast<uint32_t>(args.warmup_ops * args.batch_size + 1024);
+      next_insert_id += static_cast<uint32_t>(args.warmup_ops + 1024);
     }
   }
   if (args.workload == "query" || args.workload == "both") {
