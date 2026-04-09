@@ -296,15 +296,18 @@ public:
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_rerank_update, t_rerank_update);
         }
 
-        const auto t_finalize = std::chrono::steady_clock::now();
+        const auto t_beam_sort = std::chrono::steady_clock::now();
         std::sort(beam.begin(), beam.end(),
                   [](const auto& a, const auto& b) { return a.distance < b.distance; });
+        add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_beam_sort, t_beam_sort);
 
+        const auto t_finalize = std::chrono::steady_clock::now();
         auto& results = thread->query_results[q_id];
         results.clear();
         u32 count = std::min(k_, static_cast<u32>(beam.size()));
 
         // We need to resolve node IDs — read the nodes for top-k
+        const auto t_result_ids = std::chrono::steady_clock::now();
         for (u32 i = 0; i < count; ++i) {
             s_ptr<VamanaNode> node;
             const auto t_cache_lookup = std::chrono::steady_clock::now();
@@ -316,6 +319,7 @@ public:
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup, t_cache_lookup);
             results.push_back(node->id());
         }
+        add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_result_ids, t_result_ids);
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_finalize, t_finalize);
 
         beam.clear();
@@ -685,12 +689,14 @@ public:
                 // Need to prune: gather all candidate neighbors + new node
                 ++thread->stats.build_overflow_prunes;
                 const auto t_overflow_prepare = std::chrono::steady_clock::now();
+                const auto t_neighbor_collect = std::chrono::steady_clock::now();
                 vec<RemotePtr> all_candidate_ptrs;
                 all_candidate_ptrs.reserve(neighbor_nlist->num_neighbors() + 1);
                 for (const auto& n : neighbor_nlist->view()) {
                     all_candidate_ptrs.push_back(n);
                 }
                 all_candidate_ptrs.push_back(new_ptr);
+                add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_neighbor_collect, t_neighbor_collect);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_overflow_prepare, t_overflow_prepare);
 
                 u32 n_all = all_candidate_ptrs.size();

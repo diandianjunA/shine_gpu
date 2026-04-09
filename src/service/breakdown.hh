@@ -47,6 +47,8 @@ enum class Subcategory : u8 {
   cpu_query_rerank_collect,
   cpu_query_rerank_prepare,
   cpu_query_rerank_update,
+  cpu_query_beam_sort,
+  cpu_query_result_ids,
   cpu_query_finalize,
   cpu_insert_init,
   cpu_insert_select,
@@ -58,6 +60,7 @@ enum class Subcategory : u8 {
   cpu_insert_candidate_sort,
   cpu_insert_prune_prepare,
   cpu_insert_quantize_prepare,
+  cpu_insert_neighbor_collect,
   cpu_insert_finalize,
   cpu_insert_neighbor_prepare,
   cpu_insert_pruned_neighbor_collect,
@@ -122,6 +125,8 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_query_rerank_collect_ns",
   "cpu_query_rerank_prepare_ns",
   "cpu_query_rerank_update_ns",
+  "cpu_query_beam_sort_ns",
+  "cpu_query_result_ids_ns",
   "cpu_query_finalize_ns",
   "cpu_insert_init_ns",
   "cpu_insert_select_ns",
@@ -133,6 +138,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_insert_candidate_sort_ns",
   "cpu_insert_prune_prepare_ns",
   "cpu_insert_quantize_prepare_ns",
+  "cpu_insert_neighbor_collect_ns",
   "cpu_insert_finalize_ns",
   "cpu_insert_neighbor_prepare_ns",
   "cpu_insert_pruned_neighbor_collect_ns",
@@ -193,6 +199,8 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_query_rerank_collect:
     case Subcategory::cpu_query_rerank_prepare:
     case Subcategory::cpu_query_rerank_update:
+    case Subcategory::cpu_query_beam_sort:
+    case Subcategory::cpu_query_result_ids:
     case Subcategory::cpu_query_finalize:
     case Subcategory::cpu_insert_init:
     case Subcategory::cpu_insert_select:
@@ -204,6 +212,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_insert_candidate_sort:
     case Subcategory::cpu_insert_prune_prepare:
     case Subcategory::cpu_insert_quantize_prepare:
+    case Subcategory::cpu_insert_neighbor_collect:
     case Subcategory::cpu_insert_finalize:
     case Subcategory::cpu_insert_neighbor_prepare:
     case Subcategory::cpu_insert_pruned_neighbor_collect:
@@ -508,7 +517,11 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     sub[std::string{kCategoryNames[static_cast<size_t>(parent_category(subcat))]}]
        [std::string{kSubcategoryNames[i]}] = aggregate.subcategory_ns[i];
   }
-  sub["cpu_ns"]["cpu_other_ns"] = aggregate.cpu_other_ns();
+  if (aggregate.operation == Operation::query) {
+    sub["cpu_ns"]["cpu_query_runtime_overhead_ns"] = aggregate.cpu_other_ns();
+  } else {
+    sub["cpu_ns"]["cpu_insert_runtime_overhead_ns"] = aggregate.cpu_other_ns();
+  }
   out["sub_breakdown"] = std::move(sub);
 
   out["counters"] = {
