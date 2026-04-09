@@ -42,13 +42,20 @@ enum class Subcategory : u8 {
   cpu_cache_lookup = 0,
   cpu_query_select,
   cpu_query_filter,
+  cpu_query_stage_candidates,
   cpu_query_beam_update,
+  cpu_query_rerank_prepare,
+  cpu_query_rerank_update,
   cpu_query_finalize,
   cpu_insert_init,
   cpu_insert_select,
   cpu_insert_filter,
+  cpu_insert_stage_candidates,
   cpu_insert_beam_update,
+  cpu_insert_candidate_sort,
   cpu_insert_prune_prepare,
+  cpu_insert_quantize_prepare,
+  cpu_insert_finalize,
   cpu_insert_neighbor_prepare,
   cpu_insert_overflow_prepare,
 
@@ -106,13 +113,20 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_cache_lookup_ns",
   "cpu_query_select_ns",
   "cpu_query_filter_ns",
+  "cpu_query_stage_candidates_ns",
   "cpu_query_beam_update_ns",
+  "cpu_query_rerank_prepare_ns",
+  "cpu_query_rerank_update_ns",
   "cpu_query_finalize_ns",
   "cpu_insert_init_ns",
   "cpu_insert_select_ns",
   "cpu_insert_filter_ns",
+  "cpu_insert_stage_candidates_ns",
   "cpu_insert_beam_update_ns",
+  "cpu_insert_candidate_sort_ns",
   "cpu_insert_prune_prepare_ns",
+  "cpu_insert_quantize_prepare_ns",
+  "cpu_insert_finalize_ns",
   "cpu_insert_neighbor_prepare_ns",
   "cpu_insert_overflow_prepare_ns",
   "gpu_query_prepare_ns",
@@ -166,13 +180,20 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_cache_lookup:
     case Subcategory::cpu_query_select:
     case Subcategory::cpu_query_filter:
+    case Subcategory::cpu_query_stage_candidates:
     case Subcategory::cpu_query_beam_update:
+    case Subcategory::cpu_query_rerank_prepare:
+    case Subcategory::cpu_query_rerank_update:
     case Subcategory::cpu_query_finalize:
     case Subcategory::cpu_insert_init:
     case Subcategory::cpu_insert_select:
     case Subcategory::cpu_insert_filter:
+    case Subcategory::cpu_insert_stage_candidates:
     case Subcategory::cpu_insert_beam_update:
+    case Subcategory::cpu_insert_candidate_sort:
     case Subcategory::cpu_insert_prune_prepare:
+    case Subcategory::cpu_insert_quantize_prepare:
+    case Subcategory::cpu_insert_finalize:
     case Subcategory::cpu_insert_neighbor_prepare:
     case Subcategory::cpu_insert_overflow_prepare:
       return Category::cpu;
