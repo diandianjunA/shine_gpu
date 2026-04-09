@@ -245,9 +245,11 @@ public:
             const auto t_rerank_fetch = std::chrono::steady_clock::now();
             vec<RemotePtr> rerank_ptrs;
             rerank_ptrs.reserve(beam.size());
+            const auto t_rerank_collect = std::chrono::steady_clock::now();
             for (const auto& entry : beam) {
                 rerank_ptrs.push_back(entry.rptr);
             }
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_rerank_collect, t_rerank_collect);
 
             vec<byte_t*> rerank_vec_bufs = co_await rdma::vamana::batch_read_vectors(rerank_ptrs, thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_rerank_fetch, t_rerank_fetch);
@@ -524,17 +526,21 @@ public:
         }
 
         // Phase 2: GPU RobustPrune to select R neighbors
+        const auto t_preprune_sort = std::chrono::steady_clock::now();
         std::sort(beam.begin(), beam.end(),
                   [](const auto& a, const auto& b) { return a.distance < b.distance; });
+        add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_preprune_sort, t_preprune_sort);
 
         const u32 n_candidates = beam.size();
 
         // Collect candidate RemotePtrs and distances (already sorted)
+        const auto t_candidate_collect = std::chrono::steady_clock::now();
         vec<RemotePtr> candidate_rptrs;
         candidate_rptrs.reserve(n_candidates);
         for (auto& entry : beam) {
             candidate_rptrs.push_back(entry.rptr);
         }
+        add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_candidate_collect, t_candidate_collect);
 
         // Batch read full vectors for all candidates (for RobustPrune)
         const auto t_candidate_fetch = std::chrono::steady_clock::now();
@@ -591,12 +597,14 @@ public:
         const u32 pruned_count = *gs.h_pruned_count;
 
         // Map pruned indices back to RemotePtrs
+        const auto t_pruned_collect = std::chrono::steady_clock::now();
         vec<RemotePtr> selected_neighbors;
         selected_neighbors.reserve(pruned_count);
         for (u32 i = 0; i < pruned_count; ++i) {
             u32 idx = gs.h_pruned_indices[i];
             selected_neighbors.push_back(candidate_rptrs[idx]);
         }
+        add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_pruned_neighbor_collect, t_pruned_collect);
 
         // Free candidate vector buffers (bump allocator; no individual free)
 
@@ -809,12 +817,14 @@ public:
                 cudaStreamSynchronize(gs.stream);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_overflow_prune_d2h, t_overflow_prune_d2h);
 
+                const auto t_pruned_collect = std::chrono::steady_clock::now();
                 u32 new_count = *gs.h_pruned_count;
                 vec<RemotePtr> pruned_neighbors;
                 pruned_neighbors.reserve(new_count);
                 for (u32 i = 0; i < new_count; ++i) {
                     pruned_neighbors.push_back(all_candidate_ptrs[gs.h_pruned_indices[i]]);
                 }
+                add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_pruned_neighbor_collect, t_pruned_collect);
 
                 const auto t_pruned_neighbor_write = std::chrono::steady_clock::now();
                 co_await rdma::vamana::write_vamana_neighbors(

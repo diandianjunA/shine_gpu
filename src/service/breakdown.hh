@@ -44,6 +44,7 @@ enum class Subcategory : u8 {
   cpu_query_filter,
   cpu_query_stage_candidates,
   cpu_query_beam_update,
+  cpu_query_rerank_collect,
   cpu_query_rerank_prepare,
   cpu_query_rerank_update,
   cpu_query_finalize,
@@ -51,12 +52,15 @@ enum class Subcategory : u8 {
   cpu_insert_select,
   cpu_insert_filter,
   cpu_insert_stage_candidates,
+  cpu_insert_preprune_sort,
+  cpu_insert_candidate_collect,
   cpu_insert_beam_update,
   cpu_insert_candidate_sort,
   cpu_insert_prune_prepare,
   cpu_insert_quantize_prepare,
   cpu_insert_finalize,
   cpu_insert_neighbor_prepare,
+  cpu_insert_pruned_neighbor_collect,
   cpu_insert_overflow_prepare,
 
   // GPU
@@ -115,6 +119,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_query_filter_ns",
   "cpu_query_stage_candidates_ns",
   "cpu_query_beam_update_ns",
+  "cpu_query_rerank_collect_ns",
   "cpu_query_rerank_prepare_ns",
   "cpu_query_rerank_update_ns",
   "cpu_query_finalize_ns",
@@ -122,12 +127,15 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_insert_select_ns",
   "cpu_insert_filter_ns",
   "cpu_insert_stage_candidates_ns",
+  "cpu_insert_preprune_sort_ns",
+  "cpu_insert_candidate_collect_ns",
   "cpu_insert_beam_update_ns",
   "cpu_insert_candidate_sort_ns",
   "cpu_insert_prune_prepare_ns",
   "cpu_insert_quantize_prepare_ns",
   "cpu_insert_finalize_ns",
   "cpu_insert_neighbor_prepare_ns",
+  "cpu_insert_pruned_neighbor_collect_ns",
   "cpu_insert_overflow_prepare_ns",
   "gpu_query_prepare_ns",
   "gpu_query_distance_ns",
@@ -182,6 +190,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_query_filter:
     case Subcategory::cpu_query_stage_candidates:
     case Subcategory::cpu_query_beam_update:
+    case Subcategory::cpu_query_rerank_collect:
     case Subcategory::cpu_query_rerank_prepare:
     case Subcategory::cpu_query_rerank_update:
     case Subcategory::cpu_query_finalize:
@@ -189,12 +198,15 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_insert_select:
     case Subcategory::cpu_insert_filter:
     case Subcategory::cpu_insert_stage_candidates:
+    case Subcategory::cpu_insert_preprune_sort:
+    case Subcategory::cpu_insert_candidate_collect:
     case Subcategory::cpu_insert_beam_update:
     case Subcategory::cpu_insert_candidate_sort:
     case Subcategory::cpu_insert_prune_prepare:
     case Subcategory::cpu_insert_quantize_prepare:
     case Subcategory::cpu_insert_finalize:
     case Subcategory::cpu_insert_neighbor_prepare:
+    case Subcategory::cpu_insert_pruned_neighbor_collect:
     case Subcategory::cpu_insert_overflow_prepare:
       return Category::cpu;
     case Subcategory::gpu_query_prepare:
