@@ -460,7 +460,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     query_count = std::max<size_t>(
       bootstrap_count,
       args.measure_seconds > 0 ? args.client_threads * 4096 : args.measure_ops * args.client_threads);
-    query_data = bootstrap_vectors;
+    std::vector<uint32_t> query_ids(query_count);
+    std::iota(query_ids.begin(), query_ids.end(), bootstrap_count + 1);
+    query_data = make_dataset(query_ids, dim);
+    root["meta"]["synthetic_query_vectors"] = query_count;
   }
 
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) {
